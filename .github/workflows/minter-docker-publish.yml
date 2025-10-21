@@ -69,6 +69,7 @@ jobs:
         uses: docker/build-push-action@v6.18.0
         with:
           context: .
+          file: minter/Dockerfile
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
