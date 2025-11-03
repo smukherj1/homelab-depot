@@ -32,7 +32,7 @@ func gcsDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if o == "" {
-		http.Error(w, "required URL query paramter 'bucket' was not provided", http.StatusBadRequest)
+		http.Error(w, "required URL query paramter 'object' was not provided", http.StatusBadRequest)
 		return
 	}
 
@@ -48,15 +48,15 @@ func gcsDownload(w http.ResponseWriter, r *http.Request) {
 		log.Printf("GCS Download error: Bucket %q, object %q: %v", b, o, err)
 		if errors.Is(err, storage.ErrObjectNotExist) {
 			http.Error(w, fmt.Sprintf("bucket %q, object %q does not exist", b, o), http.StatusNotFound)
+		} else {
+			http.Error(w, fmt.Sprintf("unable to initialize reading bucket %q, object %q", b, o), http.StatusInternalServerError)
 		}
-
-		http.Error(w, fmt.Sprintf("unable to initialize reading bucket %q, object %q", b, o), http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
 	if _, err := io.Copy(w, or); err != nil {
 		log.Printf("GCS error streaming to client: Bucket %q, object %q: %v", b, o, err)
-		http.Error(w, fmt.Sprintf("unable to stream contents of bucket %q, object %o", b, o), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("unable to stream contents of bucket %q, object %q", b, o), http.StatusInternalServerError)
 	}
 }
 
