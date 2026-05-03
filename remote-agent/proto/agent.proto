@@ -142,8 +142,10 @@ message GetPathMetadataRequest {
 }
 
 message FileMetadata {
+    // Name of the file within a directory.
+    string name = 1;
     // Size of the file in bytes.
-    uint64 size = 1;
+    uint64 size = 2;
     // TODO: Also add details like creation, modification times
     // in unix epoch and file mode bits.
 }

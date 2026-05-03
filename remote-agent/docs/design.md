@@ -168,11 +168,11 @@ Safe Unix mode validation accepts regular file permissions only. v1 accepts
 sticky bit, device bits, and values outside the permission mask. The server
 applies the requested mode after the file is fully written and verified.
 
-Upload writes to a temporary file in the destination directory and commits
-atomically with `rename` only after all validation passes. Intermediate
-directories are created with private directory permissions. If any validation,
-I/O, digest, cancellation, or session error occurs, the temporary file is
-removed and the destination path is left unchanged.
+Upload writes to the destination path creating any intermediate directories as
+necessary. If any validation, I/O, digest, cancellation, or session error occurs,
+the partially uploaded file is left untouched. It's the caller's responsibility
+to retry failed uploads. The server _may_ decide to delete the file that failed
+to upload.
 
 `UploadResponse.next_offset` returns the next expected offset on success. On
 offset errors the RPC returns `InvalidArgument`; callers should start a new
@@ -191,10 +191,8 @@ The final chunk sets `final = true` and includes the SHA-256 digest for the file
 contents transferred by the server. Partial resume and range download are not
 supported.
 
-If the file changes during download, the server may return `Aborted` or
-`Internal` rather than a digest for inconsistent data. v1 callers should treat
-downloads as valid only when the stream completes successfully and the final
-digest matches the received bytes.
+It's undefined behavior for the client to attempt to download a file that's
+currently being uploaded or wasn't uploaded successfully.
 
 ### Metadata
 
