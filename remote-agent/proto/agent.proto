@@ -3,6 +3,8 @@ syntax = "proto3";
 
 package homelabdepot.remoteagent;
 
+option go_package = "github.com/smukherj/homelab-depot/remote-agent/gen/go/agentpb;agentpb";
+
 service Agent {
     // Get the agent status. Can be used to check if the agent process is
     // alive or has crashed.
@@ -141,29 +143,34 @@ message GetPathMetadataRequest {
     string path = 2;
 }
 
-message FileMetadata {
-    // Name of the file within a directory.
-    string name = 1;
-    // Size of the file in bytes.
-    uint64 size = 2;
-    // TODO: Also add details like creation, modification times
-    // in unix epoch and file mode bits.
+enum FileType {
+    FILE_TYPE_UNSPECIFIED = 0;
+    FILE_TYPE_REGULAR = 1;
+    FILE_TYPE_DIRECTORY = 2;
+    FILE_TYPE_SYMLINK = 3;
+    FILE_TYPE_OTHER = 4;
 }
-message SubdirectoryMetadata {
-    // Name of the sub-directory within a directory.
+
+message PathMetadata {
+    // Name of this entry. For a direct file lookup, this is the base name of the
+    // requested path. For the workspace root, this is ".".
     string name = 1;
+    FileType type = 2;
+    // Size of the file in bytes.
+    uint64 size = 3;
+    // Unix file mode bits.
+    uint32 mode = 4;
+    int64 mtime_unix_seconds = 5;
+    int32 mtime_nanos = 6;
 }
 message DirectoryMetadata{
-    // One or more files in this directory.
-    repeated FileMetadata file_metadata = 1;
-    // One or more sub-directories in this directory. Only
-    // returns immediate child directories.
-    repeated SubdirectoryMetadata subdirectory_metadata = 2;
+    // Immediate child entries, sorted by name.
+    repeated PathMetadata entries = 1;
 }
 message GetPathMetadataResponse {
     oneof response {
         // Returned when the requested path is a file.
-        FileMetadata file_metadata = 1;
+        PathMetadata file_metadata = 1;
         // Returns when the requested path is a directory.
         DirectoryMetadata directory_metadata = 2;
     }

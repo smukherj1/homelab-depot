@@ -1,0 +1,53 @@
+name: remote-agent
+
+on:
+  push:
+    paths:
+      - "remote-agent/**"
+      - ".github/workflows/remote-agent.yml"
+  pull_request:
+    paths:
+      - "remote-agent/**"
+      - ".github/workflows/remote-agent.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: remote-agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: remote-agent/go.mod
+          cache-dependency-path: remote-agent/go.sum
+      - name: Install protoc plugins
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.7
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
+      - uses: bufbuild/buf-setup-action@v1
+      - name: Format
+        run: test -z "$(gofmt -l .)"
+      - name: Proto lint
+        run: make proto-lint
+      - name: Proto check
+        run: make proto-check
+      - name: Unit and integration tests
+        run: make test
+      - name: Build
+        run: make build
+
+  docker-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: remote-agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: remote-agent/go.mod
+          cache-dependency-path: remote-agent/go.sum
+      - name: Docker-backed tests
+        run: make test-docker

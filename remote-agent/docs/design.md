@@ -294,8 +294,7 @@ take precedence over environment variables, which take precedence over defaults.
 
 Required v1 settings:
 
-- listen address, default `127.0.0.1:0` for tests and a documented loopback port
-  for production use;
+- listen address.
 - workspace root, default under the OS temporary directory;
 - session idle timeout, default 5 minutes;
 - max upload file size;
