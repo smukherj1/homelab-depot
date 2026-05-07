@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+package homelabdepot.remoteagent;
+
+option go_package = "github.com/smukherj/homelab-depot/remote-agent/gen/go/runnerpb;runnerpb";
+
+
+service Runner {
+    rpc GetStatus(GetStatusRequest) returns(GetStatusResponse);
+    rpc GetLog(GetLogRequest) returns(stream GetLogResponse);
+}
+
+message GetStatusRequest{}
+
+message GetStatusResponse{
+    LogStatus log_status = 1;
+    ProcessStatus process_status = 2;
+}
+
+message LogStatus {
+    // The current starting offset of logs that can be streamed
+    // using GetLog.
+    uint64 begin_offset = 1;
+    // The current ending offset of logs that can be streamed
+    // using GetLog.
+    uint64 end_offset = 2;
+}
+
+message ProcessStatus {
+    // Most recent time the runner launched the process it's managing.
+    uint64 start_time_ms = 1;
+    // Number of times the process launched by the runner had to be
+    // restarted since the runner started.
+    uint64 restarts = 2;
+    // The command the runner is running to launch the process.
+    repeated string cmd = 3;
+}
+
+enum LogSource {
+    LOG_SOURCE_UNSPECIFIED = 0;
+    LOG_SOURCE_STDOUT = 1;
+    LOG_SOURCE_STDERR = 2;
+}
+
+message GetLogRequest{
+    LogSource source = 1;
+    // Stream logs from the given offset. Setting to 0 streams from whatever
+    // is the current starting offset.
+    uint64 offset = 2;
+    // Stream up to the specified number of log bytes. Setting to 0 means no
+    // limit.
+    uint64 limit = 3;
+}
+
+message GetLogResponse{
+    repeated LogEntry log_entry = 1;
+}
+
+enum LogLevel {
+    LOG_LEVEL_UNSPECIFIED = 0;
+    LOG_LEVEL_DEBUG = 1;
+    LOG_LEVEL_INFO = 2;
+    LOG_LEVEL_WARN = 3;
+    LOG_LEVEL_ERROR = 4;
+}
+
+message LogEntry {
+    int64 timestamp_ms = 1;
+    LogLevel level = 2;
+    string msg = 3;
+}
