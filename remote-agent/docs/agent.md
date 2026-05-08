@@ -311,10 +311,6 @@ Required v1 settings:
 All size, timeout, and address values are validated at startup. Invalid
 configuration fails fast before the gRPC listener starts.
 
-The server always binds to loopback for v1. Attempts to configure `0.0.0.0`,
-`::`, a non-loopback IP, or a hostname that resolves outside loopback should be
-rejected.
-
 ## Package and module layout
 
 Paths are relative to `remote-agent/`.
@@ -387,8 +383,7 @@ Buf, but CI verifies that committed generated code matches `proto/agent.proto`.
 ## CLI client
 
 `agentctl` is the reference client for the gRPC API. It accepts an agent address
-that must point at a loopback listener, SSH tunnel, VPN endpoint, or trusted
-local proxy.
+to talk to.
 
 Initial commands:
 
