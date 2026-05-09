@@ -103,7 +103,7 @@ Integration tests:
 Implement `internal/config`:
 
 - `LoadFile(path string) (Config, error)` reads YAML, applies defaults, resolves
-  relative log directories against the current working directory, and validates
+  relative directories against the current working directory, and validates
   all fields before returning.
 - `ParseSize(string) (uint64, error)` accepts only `B`, `KiB`, `MiB`, and `GiB`
   binary units with non-negative integer amounts.
@@ -127,7 +127,8 @@ Unit tests:
 - Boundary tests cover minimum and maximum restart delay, graceful shutdown
   timeout, max entry size, disk budgets, and event retention count.
 - Directory validation covers missing directory creation, existing file path,
-  and non-writable directory where the platform allows the test to set that up.
+  and non-writable directory where the platform allows the test to set that up and
+  sub-dir validation (boths ways between process and logs dir).
 
 Integration tests:
 

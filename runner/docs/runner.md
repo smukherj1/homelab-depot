@@ -48,8 +48,6 @@ deployment.
 - Preserving child logs across runner restarts.
 - Exposing child process environment variables in status.
 - Configuring child process environment variables in v1.
-- Configuring a child working directory in v1; the child inherits runner's
-  working directory.
 - Implementing network security inside runner.
 - Core dump collection in v1.
 
@@ -458,9 +456,10 @@ process:
   command: ["./agent", "--config", "agent.yaml"]
   restart_delay: "5s"
   graceful_shutdown_timeout: "30s"
+  working_directory: "./process"
 
 logs:
-  directory: "./runner-logs"
+  directory: "./logs"
   max_entry_size: "16KiB"
   stdout:
     disk_budget: "128MiB"
@@ -487,12 +486,13 @@ Required fields:
 
 - `server.listen_address`;
 - `process.command`;
-- `logs.directory`.
 
 Defaulted fields:
 
 - `process.restart_delay`: `5s`;
 - `process.graceful_shutdown_timeout`: `30s`;
+- `process.working_directory`: `./process`
+- `logs.directory`: `./logs`
 - `logs.max_entry_size`: `16KiB`;
 - `logs.stdout.disk_budget`: `128MiB`;
 - `logs.stderr.disk_budget`: `128MiB`;
@@ -510,10 +510,17 @@ literally exactly as configured.
 `server.listen_address` is required and has no default. Runner does not assume
 loopback or all-interface binding.
 
-`logs.directory` is required. It may be absolute or relative. Relative paths are
-resolved against runner's current working directory. Runner creates the directory
-if it does not exist. If it exists but is not a directory, cannot be created, or
-is not writable, startup validation fails before launching the child process.
+`process.working_directory` is optional. It may be absolute or relative but not
+empty. The directory is created if it doesn't exist. Relative paths are relative
+to runner's working directory.
+
+`logs.directory` is optional. It may be absolute or relative but not empty.
+Relative paths are resolved against runner's current working directory.
+Runner creates the directory if it does not exist. If it exists but is not a
+directory, cannot be created, or is not writable, startup validation fails
+before launching the child process. Startup validation also fails if either
+logs or process directories are sub-directories of one another to defend against
+this.
 
 All YAML string values are literal. Runner does not perform shell interpolation,
 globbing, tilde expansion, or environment variable expansion.
@@ -532,22 +539,25 @@ decides whether zero is allowed.
 Default configuration values include:
 
 - process restart delay: 5 seconds;
+- process working directory: ./process;
 - graceful shutdown timeout: 30 seconds;
 - stdout disk budget: 128MiB;
 - stderr disk budget: 128MiB;
 - maximum log entry size: 16KiB;
 - retained runner event count: 1024.
+- logs directory: ./logs
 
 Validation rules include:
 
 - process restart delay must be between 100ms and 1h, inclusive;
+- process directory is set and is not a sub-dir of logs directory;
 - graceful shutdown timeout must be between 0s and 10m, inclusive;
 - stdout and stderr disk budgets must each be at least 16MiB;
+- logs directory is set and is not a sub-dir of process directory;
 - maximum log entry size must be between 1KiB and 1MiB, inclusive;
 - retained runner event count must be between 1 and 65536, inclusive.
 
-The child process inherits runner's working directory. v1 does not configure
-child environment variables.
+v1 does not configure child environment variables.
 
 All sizes, durations, listen addresses, command arrays, log formats, disk
 budgets, and retention counts are validated on startup. Invalid configuration
