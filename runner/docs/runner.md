@@ -27,7 +27,7 @@ deployment.
 - Retain child logs on disk with separate configurable disk budgets for stdout
   and stderr.
 - Rotate retained logs when a stream exceeds its disk budget.
-- Expose current log begin and end offsets for every child log stream.
+- Expose current log begin and end log IDs for every child log stream.
 - Expose finite historical log reads and live-follow log streams over gRPC.
 - Keep a configurable in-memory ring of recent runner events.
 - Expose runner events through a dedicated non-streaming RPC.
@@ -139,9 +139,9 @@ Events should cover at least:
 - requesting events from a supplied sequence number, inclusively, so clients can
   de-duplicate and poll incrementally.
 
-`GetEvents` uses event-specific sequence numbers, not log offset terminology.
+`GetEvents` uses event-specific sequence numbers, not log ID terminology.
 Runner event sequence numbers are global to the runner event stream and are
-independent from child stdout and stderr log offsets.
+independent from child stdout and stderr log IDs.
 
 `GetEvents` should use a request-mode `oneof`:
 
@@ -179,31 +179,29 @@ Child logs are exposed as structured log entries. Each accepted log entry has:
 - message;
 - source location, when present in structured logs;
 - stream source: stdout or stderr;
-- per-stream offset;
+- per-stream log ID;
 - whether the stored entry was truncated.
 
-The API offset model is entry based rather than raw file or byte based. Each
-accepted child log entry receives an absolute monotonically increasing `uint64`
-offset. Offsets are independent per child log stream: stdout and stderr each
-have their own offset sequence.
+The API log ID model is entry based rather than byte based. Each accepted child
+log entry receives an absolute monotonically increasing `uint64` log ID. Log IDs
+are independent per child log stream: stdout and stderr each have their own log
+ID sequence.
 
-The first accepted entry in a stream has offset `0`; the next accepted entry in
-that same stream has offset `1`, and so on until runner restarts. Rotation never
-renumbers retained entries. `stdout` offset `42` and `stderr` offset `42` may
+The first accepted entry in a stream has log ID `0`; the next accepted entry in
+that same stream has log ID `1`, and so on until runner restarts. Rotation never
+renumbers retained entries. `stdout` log ID `42` and `stderr` log ID `42` may
 refer to unrelated entries.
 
-Offsets are assigned after validation and parsing. Rejected log lines do not
-consume child log offsets. Oversized but otherwise accepted log lines consume
-one offset and set `LogEntry.truncated = true`.
+Log IDs are assigned after validation and parsing. Rejected log lines do not
+consume child log IDs. Oversized but otherwise accepted log lines consume one
+log ID and set `LogEntry.truncated = true`.
 
-`GetStatus` exposes the currently retained offset range for every child log
-stream. `begin_offset` is the oldest retained entry offset. `end_offset` is one
-past the newest assigned entry offset. Retained entries are in the half-open
-range `[begin_offset, end_offset)`.
+`GetStatus` exposes the currently retained log ID range for every child log
+stream. `begin_log_id` is the oldest retained entry log ID. `end_log_id` is one
+past the newest assigned entry log ID. Retained entries are in the half-open
+range `[begin_log_id, end_log_id)`.
 
-If no entries have ever been accepted for a stream, both offsets are `0`. If
-entries existed but all have rotated out, `begin_offset == end_offset`, and both
-equal the next offset that will be assigned.
+If no entries have ever been accepted for a stream, both log IDs are `0`.
 
 The maximum log entry size applies to the raw newline-delimited child output
 entry before format-specific parsing. It is measured in bytes after UTF-8
@@ -226,7 +224,7 @@ stores the entry with `truncated = true`.
 
 Invalid UTF-8 lines are rejected, omitted from the child log stream, and
 represented only by a runner event containing the reason, source stream, and the
-stream's current `end_offset` as context. The raw invalid bytes are not included
+stream's current `end_log_id` as context. The raw invalid bytes are not included
 in the event.
 
 Plain-text entries use fixed levels by stream: stdout entries use `INFO`, and
@@ -290,7 +288,7 @@ runner event.
 If a structured log line is invalid JSON, or valid JSON but missing required
 timestamp, level, or message fields, runner rejects the line and emits a runner
 event. Rejected structured log lines are omitted from the child log stream and do
-not consume a child log offset.
+not consume a child log ID.
 
 The rejection event includes the raw bad line, subject to the same per-entry size
 limit as ordinary logs and events.
@@ -301,7 +299,7 @@ to parse the retained prefix. If the prefix parses as a valid structured log
 entry, the entry is accepted with `truncated = true`. If the prefix cannot be
 parsed as a valid structured log entry, runner rejects the line and emits a
 runner event that includes the retained raw prefix with `truncated = true`, the
-source stream, the rejection reason, and the stream's current `end_offset` as
+source stream, the rejection reason, and the stream's current `end_log_id` as
 context.
 
 Accepted truncation does not emit a runner event. The accepted child log entry's
@@ -314,140 +312,105 @@ can be large. Each stream has a separate configurable disk budget.
 
 Disk budgets are configured with explicit binary size strings such as `16MiB` or
 `1GiB`. Invalid or too-small budgets fail runner startup. The default disk
-budget is 128MiB per stream. Each stream budget must be at least 16MiB. Runner does not
-enforce an explicit maximum budget and does not validate the budget against
-currently available disk in v1.
+budget is 128MiB per stream. Each stream budget must be at least 16MiB. Runner
+does not enforce an explicit maximum budget and does not validate the budget
+against currently available disk in v1.
 
 The maximum log entry size is also configured with the same binary size string
 syntax. If unset, it defaults to 16KiB. Values below 1KiB or above 1MiB fail
 runner startup validation.
 
-Logs do not need to survive runner restarts. On startup, runner deletes all
-runner-owned segment and index files in its configured log directory before
-beginning the new runner lifetime. Startup does not attempt to recover old data
-segments or rebuild missing indexes.
+Logs do not need to survive runner restarts. On startup, runner deletes the
+runner-owned SQLite database and sidecar files in its configured log directory
+before beginning the new runner lifetime. The runner-owned SQLite files are:
 
-Each stream stores logs in segment files. Segment size is an internal derived
-value, not YAML configuration. Runner derives each stream's target segment size
-from that stream's disk budget:
+- `logs.sqlite`;
+- `logs.sqlite-wal`;
+- `logs.sqlite-shm`.
 
-```text
-clamp(stream_disk_budget / 16, 1MiB, 64MiB)
-```
+Startup cleanup deletes only those fixed runner-owned filenames. Runner does not
+delete unrelated files in `logs.directory`.
 
-Runner rolls to a new segment when the current segment reaches the target segment
-size. The default 128MiB stream budget therefore uses an 8MiB target segment
-size. The minimum 16MiB stream budget uses a 1MiB target segment size.
+Runner stores child logs for both streams in a single SQLite database named
+`logs.sqlite`. The database uses WAL journal mode and `synchronous=NORMAL` so
+live readers can query retained logs while the capture path inserts new entries.
+Runner should checkpoint the WAL after retention cleanup and may also checkpoint
+periodically so the WAL does not become an unbounded hidden disk consumer.
 
-Each segment consists of a JSON Lines data file and a binary index file. The data
-file stores a header line followed by one JSON object per accepted `LogEntry`.
-The index file stores a fixed binary header followed by fixed-width index
-records. Rotation deletes whole data/index segment pairs.
+The log table stores parsed API fields only. It does not store the original raw
+log line or ignored structured attributes. Each row stores enough to reconstruct
+the API `LogEntry`:
 
-Segment filenames include the stream and the segment base offset:
+- `source`, either `stdout` or `stderr`;
+- `log_id`, the per-stream monotonically increasing log ID;
+- `ts`, the log timestamp;
+- `level`;
+- `message`;
+- `truncated`;
+- optional source location fields: file, function, and line;
+- `stored_size`, the encoded retained size used for logical budget accounting.
 
-```text
-stdout-00000000000000000000.logseg
-stdout-00000000000000000000.idx
-stderr-00000000000000000000.logseg
-stderr-00000000000000000000.idx
-```
+The primary key is `(source, log_id)`. This primary key is the v1 log index and
+replaces the custom binary index. `GetLog` range reads are ordered by `log_id`
+for one selected `source`. v1 does not add a full-text index or search RPC.
 
-The base offset is exactly 20 zero-padded decimal digits, covering the full
-`uint64` range and preserving segment order under lexicographic sorting. Segment
-identity is stream plus base offset; v1 does not include a separate segment
-sequence number. Filename base offset, data header base offset, and index header
-base offset must match.
+Runner also maintains per-stream state for stdout and stderr, including:
 
-Startup cleanup deletes only runner-owned files matching the fixed stream
-patterns, such as `stdout-*.logseg`, `stdout-*.idx`, `stderr-*.logseg`, and
-`stderr-*.idx`. Runner does not delete unrelated files in `logs.directory`.
+- `source`;
+- `next_log_id`, the next log ID that will be assigned;
+- `retained_bytes`, the sum of `stored_size` values for retained rows in that
+  stream.
 
-The data file header is a JSON object line containing at least magic/type,
-format version, stream source, and base offset. Subsequent JSONL records use a
-storage-specific shape, not generated proto JSON. Each record stores enough to
-reconstruct the API `LogEntry`:
+This state may be kept in SQLite or in memory. It is an implementation detail
+for assigning log IDs and enforcing budgets; the observable retained range must
+match the rows retained for each stream.
 
-```json
-{
-  "offset": 123,
-  "ts": "2026-05-07T12:34:56.789Z",
-  "level": "INFO",
-  "message": "hello\n",
-  "source": "stdout",
-  "truncated": false,
-  "loc": {
-    "file": "/app/main.go",
-    "function": "main.run",
-    "line": 42
-  }
-}
-```
+When retained logs exceed a stream's budget, runner rotates out old data by
+deleting the oldest rows for that source until the sum of retained `stored_size`
+values is within the stream budget. Rotation advances `begin_log_id` for the
+affected stream and does not affect the other stream. If a client requests a log
+ID older than the current retained range, `GetLog` returns `OutOfRange` rather
+than silently starting at the oldest retained entry.
 
-The `loc` object is omitted when no source location is present. Data records do
-not store the original raw log line or ignored structured attributes. Although
-each stream has its own files, records still include `source` so files remain
-self-describing and readers can detect stream/file mismatches.
+Retention cleanup runs after accepting a new row for the affected stream. Since
+v1 requires each stream budget to be larger than the maximum accepted log entry
+size, cleanup should always leave at least the newest row for that stream.
 
-The binary index header contains at least magic/type, format version, stream
-source, and base offset. Index records are fixed-width 20-byte little-endian
-records:
+The disk budget is a logical per-stream budget over retained encoded log entry
+bytes, not an exact cap on physical SQLite file size. The physical
+`logs.sqlite`, WAL, and shared-memory files may temporarily exceed the sum of
+the configured stream budgets because of SQLite pages, free pages, transactions,
+and WAL checkpoint timing.
 
-```text
-uint64 offset
-uint64 data_pos
-uint32 data_len
-```
-
-`data_pos` is the byte offset in the JSONL data file of the first byte of the
-record JSON object. `data_len` includes the JSON bytes and the trailing newline,
-so `data_pos + data_len` equals the next record's expected `data_pos`. The
-offset is stored in both the JSONL data record and the binary index record so
-readers can cross-check the data/index pair.
-
-When retained logs exceed a stream's budget, runner rotates out old data. If a
-client requests an offset older than the current retained range, `GetLog`
-returns `OutOfRange` rather than silently starting at the oldest retained entry.
-Rotation advances `begin_offset` for the affected stream and does not affect the
-other stream.
-
-Rotation deletes whole segment files only. Runner does not trim within a segment
-in v1. Disk usage may exceed the configured budget by up to roughly one target
-segment, depending on rollover and write timing.
-
-Because API offsets are logical entry sequence numbers while disk files may also
-store metadata and framing, the implementation may need an index mapping entry
-offsets to file positions.
-
-During a single runner lifetime, data/index inconsistency is treated as storage
-corruption. Runner emits an error event and affected `GetLog` reads fail with
+During a single runner lifetime, unexpected SQLite errors are treated as storage
+failures. Runner emits an error event and affected `GetLog` reads fail with
 `Internal`. Runner should keep supervising the child process if possible, but it
-must not silently serve mismatched log data or silently delete corrupt active
-data as a v1 recovery strategy. Storage corruption events include the stream,
-segment base offset, relevant data and/or index paths, and the corruption reason.
+must not silently serve incomplete or inconsistent log data. Storage failure
+events include the operation, stream when relevant, database path, and failure
+reason.
 
 ## Log Streaming API
 
-`GetStatus` exposes `begin_offset` and `end_offset` for every child log stream:
+`GetStatus` exposes `begin_log_id` and `end_log_id` for every child log stream:
 stdout and stderr.
 
 `GetLog` reads one source stream at a time: stdout or stderr.
 
 `GetLog` supports both historical reads and live follow:
 
-- request `begin_offset` to start at the oldest retained entry;
-- request a retained entry offset to resume from that entry;
-- request `end_offset` to wait for future entries;
+- request `begin_log_id` to start at the oldest retained entry;
+- request a retained entry log ID to resume from that entry;
+- request `end_log_id` to wait for future entries;
 - request `max_entries > 0` to stream until that many log entries have been
   delivered, then end the RPC;
 - request `max_entries = 0` to follow forever until client cancellation.
 
-Valid requested offsets are `begin_offset <= offset <= end_offset` for the
-selected stream. If `offset < begin_offset` or `offset > end_offset`, `GetLog`
+Valid requested log IDs are `begin_log_id <= log_id <= end_log_id` for the
+selected stream. If `log_id < begin_log_id` or `log_id > end_log_id`, `GetLog`
 returns `OutOfRange`.
 
 When `max_entries > 0`, the server streams entries already available at the
-requested offset, then continues streaming entries as they materialize until the
+requested log ID, then continues streaming entries as they materialize until the
 requested count has been reached or the client cancels.
 
 When `max_entries = 0`, the server streams entries as soon as they are available
@@ -459,7 +422,7 @@ cancellation strategy. The server does not impose a v1 idle timeout on log
 streams.
 
 Responses may batch multiple log entries for efficiency. Each `LogEntry` carries
-its own offset, so batching is a transport detail. The server should
+its own log ID, so batching is a transport detail. The server should
 opportunistically batch adjacent available entries without intentional delay. If
 one read from the child process yields multiple complete accepted log entries,
 active matching `GetLog` streams may receive those entries in one response.
@@ -604,10 +567,10 @@ Likely changes:
 - include per-stream log status for stdout and stderr in `GetStatus`;
 - include `running`, current start time, last exit time, last exit code, and last
   exit signal in process status;
-- add `offset`, `truncated`, and optional structured source location to
+- add `log_id`, `truncated`, and optional structured source location to
   `LogEntry`;
 - keep `GetLogResponse` as `repeated LogEntry entries` and do not require batch
-  `begin_offset` or `end_offset` fields;
+  `begin_log_id` or `end_log_id` fields;
 - use a `oneof` request mode for `GetEventsRequest` with `uint64
   from_sequence_number` and `uint64 last_count`;
 - include `next_sequence_number` in `GetEventsResponse`;
@@ -617,10 +580,10 @@ Likely changes:
 `GetLog` should use gRPC status codes consistently:
 
 - `InvalidArgument` for unknown log source or malformed request values;
-- `OutOfRange` for a requested or needed offset outside the retained range;
+- `OutOfRange` for a requested or needed log ID outside the retained range;
 - `Canceled` when the client cancels a streaming request;
 - `Internal` for unexpected storage or indexing failures.
 
 `OutOfRange` errors from `GetLog`, including mid-stream rotation errors, should
-include structured range details: source stream, requested or needed offset,
-current `begin_offset`, and current `end_offset`.
+include structured range details: source stream, requested or needed log ID,
+current `begin_log_id`, and current `end_log_id`.

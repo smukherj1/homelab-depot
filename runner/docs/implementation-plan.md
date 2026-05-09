@@ -7,7 +7,7 @@ repository uses conventional Go layout:
 - `internal/config`: YAML loading, defaults, size parsing, and validation.
 - `internal/events`: in-memory runner event ring.
 - `internal/logparse`: plain-text and `slog_json` child log parsing.
-- `internal/logstore`: on-disk segment and index storage, rotation, and readers.
+- `internal/logstore`: SQLite-backed log storage, retention, and readers.
 - `internal/process`: one-child supervisor and shutdown behavior.
 - `internal/server`: gRPC service implementation.
 - `proto`: protobuf API definitions.
@@ -37,7 +37,7 @@ state that the caller cannot add.
 
 Tests must make failures self-explanatory. Use assertions such as
 `t.Errorf("Validate() error = %v, want nil for default config", err)` or
-`t.Errorf("entry.Offset = %d, want %d after rejected invalid UTF-8 line", got,
+`t.Errorf("entry.LogID = %d, want %d after rejected invalid UTF-8 line", got,
 want)`. If the condition is long, put a short comment above the assertion that
 states the condition being tested.
 
@@ -77,7 +77,7 @@ server:
 - Model per-stream `LogStatus` for stdout and stderr.
 - Add process fields for `running`, `current_start_time`, `last_exit_time`,
   `last_exit_code`, `last_exit_signal`, `restart_count`, and configured command.
-- Add `LogEntry.offset`, `LogEntry.source`, `LogEntry.level` as a string,
+- Add `LogEntry.log_id`, `LogEntry.source`, `LogEntry.level` as a string,
   `LogEntry.message`, `LogEntry.truncated`, and optional source location.
 - Add `RunnerEvent`, `GetEventsRequest` with a request-mode `oneof`, and
   `GetEventsResponse.next_sequence_number`.
@@ -91,8 +91,8 @@ Unit tests:
 Integration tests:
 
 - Start a real gRPC server on `127.0.0.1:0`, call each RPC with generated
-  clients, and verify status code mappings for invalid source, out-of-range
-  offsets, and malformed event requests.
+  clients, and verify status code mappings for invalid source, out-of-range log
+  IDs, and malformed event requests.
 
 ## Phase 3: Configuration
 
@@ -172,7 +172,7 @@ Implement `internal/logparse`:
   - Stored message includes the trailing newline.
   - stdout level is `INFO`; stderr level is `ERROR`.
   - Invalid UTF-8 rejects the line, emits a runner event, and does not consume a
-    log offset.
+    log ID.
   - Oversized lines keep the allowed prefix, discard through newline or EOF, and
     set `truncated = true`.
 - Structured `slog_json` mode:
@@ -191,7 +191,7 @@ Unit tests:
 - Plain-text stdout and stderr levels are assigned correctly.
 - Timestamps are taken from first byte observation, including delayed newline.
 - EOF flushes an unterminated line.
-- Invalid UTF-8 emits an event and does not advance the offset allocator in the
+- Invalid UTF-8 emits an event and does not advance the log ID allocator in the
   caller-level test.
 - Oversized plain-text entries retain only the allowed prefix and discard the
   suffix.
@@ -207,50 +207,66 @@ Integration tests:
 - Pipe stdout and stderr from a helper process through the parser and store,
   then verify accepted entries and rejection events across both streams.
 
-## Phase 6: Log Storage and Rotation
+## Phase 6: Log Storage and Retention
 
 Implement `internal/logstore`:
 
-- Startup cleanup removes only runner-owned `stdout-*` and `stderr-*`
-  `.logseg` and `.idx` files.
-- Separate stream stores for stdout and stderr, each with independent offsets,
-  budgets, segment sizes, and retained ranges.
-- Derive target segment size with
-  `clamp(stream_disk_budget / 16, 1MiB, 64MiB)`.
-- Write JSONL data files with a self-describing header and one storage record
-  per accepted log entry.
-- Write binary indexes with a fixed header and 20-byte little-endian records:
-  `uint64 offset`, `uint64 data_pos`, `uint32 data_len`.
-- Roll segments when the current data segment reaches the target size.
-- Delete whole old segment pairs when retained bytes exceed the stream budget.
-- Detect data/index inconsistencies during reads and return storage corruption
-  errors while recording runner events.
-- Provide blocking readers that can start at any offset in
-  `[begin_offset, end_offset]`, deliver batches, and fail with out-of-range if
-  rotation removes needed entries.
+- Startup cleanup removes only runner-owned SQLite files from the configured log
+  directory: `logs.sqlite`, `logs.sqlite-wal`, and `logs.sqlite-shm`.
+- Create one SQLite database at `logs.sqlite` for both child log streams.
+- Enable WAL journal mode and `synchronous=NORMAL` during initialization so live
+  readers can query retained rows while the capture path inserts new entries.
+- Store parsed API fields only: `source`, `log_id`, timestamp, level, message,
+  truncation flag, optional source location fields, and `stored_size`.
+- Use `(source, log_id)` as the primary key and read one selected stream ordered
+  by `log_id`.
+- Maintain independent per-stream state for stdout and stderr: next log ID,
+  retained bytes, logical budget, and current retained range.
+- Assign log IDs only after parsing accepts an entry. Rejected lines do not
+  consume a log ID.
+- Enforce retention after each accepted row by deleting oldest rows for the
+  affected source until that stream's logical `stored_size` total is within its
+  budget.
+- Ensure cleanup advances only the affected stream's `begin_log_id` and leaves
+  at least the newest row for that stream.
+- Checkpoint the WAL after retention cleanup and support an optional periodic
+  checkpoint so WAL growth does not hide unbounded disk use.
+- Treat unexpected SQLite errors as storage failures: record runner events with
+  operation, stream when relevant, database path, and reason, and fail affected
+  reads with internal errors.
+- Provide blocking readers that can start at any log ID in
+  `[begin_log_id, end_log_id]`, deliver batches, and fail with out-of-range if
+  retention removes needed entries.
 
 Unit tests:
 
-- Segment filenames use stream plus 20-digit base offset and sort
-  lexicographically.
-- Headers encode and validate stream and base offset.
-- Index records round-trip exact offsets, data positions, and lengths.
-- Appending entries advances `end_offset`; rotation advances `begin_offset`.
-- stdout and stderr offsets are independent.
-- Requests below `begin_offset` or above `end_offset` return out-of-range.
-- Startup cleanup deletes only owned segment/index patterns and preserves
-  unrelated files.
-- Corrupt data/index mismatches return internal corruption errors.
+- Startup cleanup deletes only `logs.sqlite`, `logs.sqlite-wal`, and
+  `logs.sqlite-shm`, and preserves unrelated files.
+- Schema creation is idempotent and configures WAL plus `synchronous=NORMAL`.
+- Inserted rows round-trip all API fields, including optional source locations
+  and truncation flags.
+- Appending entries advances `end_log_id`; retention advances `begin_log_id`.
+- stdout and stderr log IDs and retained byte counts are independent.
+- `stored_size` accounting drives logical retention for each stream.
+- Requests below `begin_log_id` or above `end_log_id` return out-of-range.
+- Retention deletes oldest rows only for the over-budget source and leaves the
+  other stream untouched.
+- Retention leaves at least the newest accepted row when a single row fits the
+  validated budget rules.
+- WAL checkpointing after retention can be observed in tests without relying on
+  exact physical file sizes.
+- SQLite execution or scan failures return internal storage errors and emit
+  runner events.
 - Batch reads obey 1024-entry and 4 MB response-planning limits.
-- Concurrent appends, readers, and rotation pass `go test -race`.
+- Concurrent appends, readers, and retention pass `go test -race`.
 
 Integration tests:
 
-- Write enough entries to rotate multiple segments under a small test budget,
-  then verify retained ranges, deleted files, and historical reads.
-- Hold a blocking reader at `end_offset`, append entries, and verify it wakes
+- Write enough entries to exceed a small test budget, then verify retained
+  ranges, deleted rows, logical byte accounting, and historical reads.
+- Hold a blocking reader at `end_log_id`, append entries, and verify it wakes
   without intentional delay.
-- Hold a slow reader while rotation removes its needed offset and verify it
+- Hold a slow reader while retention removes its needed log ID and verify it
   fails with out-of-range.
 
 ## Phase 7: Process Supervisor
@@ -299,13 +315,13 @@ Implement `internal/server`:
 - Map internal status, log entries, and events to generated protobuf messages.
 - `GetStatus` returns process status plus per-stream stdout and stderr retained
   ranges.
-- `GetLog` validates source and offset, streams historical and live entries,
+- `GetLog` validates source and log ID, streams historical and live entries,
   batches adjacent available entries, and respects `max_entries`.
 - `GetLog` uses gRPC status codes:
   - `InvalidArgument` for unknown log source or malformed request values.
-  - `OutOfRange` for requested or needed offsets outside retained ranges.
+  - `OutOfRange` for requested or needed log IDs outside retained ranges.
   - `Canceled` when client cancellation ends the stream.
-  - `Internal` for storage or index corruption.
+  - `Internal` for unexpected storage failures.
 - `GetEvents` implements all request modes and rejects impossible malformed
   oneof states defensively.
 - Include structured out-of-range details when possible.
@@ -370,9 +386,9 @@ Add e2e tests that build and run the actual `bin/runner` binary:
 - Restart behavior:
   - Helper process exits with code `0` and later non-zero.
   - Runner records exit and restart events and increments restart count.
-- Rotation behavior:
-  - Configure small valid disk budgets and write enough logs to rotate.
-  - Verify old offsets return `OutOfRange` and current ranges remain readable.
+- Retention behavior:
+  - Configure small valid disk budgets and write enough logs to exceed them.
+  - Verify old log IDs return `OutOfRange` and current ranges remain readable.
 - Shutdown behavior:
   - Send SIGTERM to the runner.
   - Verify graceful child shutdown when cooperative and force-kill behavior with
