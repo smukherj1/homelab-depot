@@ -1,0 +1,11 @@
+server:
+  listen_address: "127.0.0.1:9090"
+
+process:
+  command: ["echo", "plain"]
+  working_directory: "./runner-process"
+
+logs:
+  directory: "./runner-logs"
+  encoding:
+    plain_text: {}
