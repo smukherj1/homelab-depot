@@ -2,70 +2,208 @@ syntax = "proto3";
 
 package homelabdepot.runner;
 
+import "google/protobuf/timestamp.proto";
+
 option go_package = "github.com/smukherj/homelab-depot/runner/gen/go/runnerpb;runnerpb";
 
-
+// Runner exposes the supervised child process status, retained child logs, and
+// retained runner lifecycle events.
 service Runner {
-    rpc GetStatus(GetStatusRequest) returns(GetStatusResponse);
-    rpc GetLog(GetLogRequest) returns(stream GetLogResponse);
+  // GetStatus returns a point-in-time snapshot of the child process and the
+  // retained ranges for stdout and stderr logs.
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+
+  // GetLog streams retained and future child log entries for one selected
+  // source. The stream ends after max_entries entries when max_entries is
+  // nonzero, or follows until client cancellation when max_entries is zero.
+  rpc GetLog(GetLogRequest) returns (stream GetLogResponse);
+
+  // GetEvents returns retained runner lifecycle events using the requested
+  // event window. This RPC is not a stream; clients poll with next_id.
+  rpc GetEvents(GetEventsRequest) returns (GetEventsResponse);
 }
 
-message GetStatusRequest{}
+// GetStatusRequest has no fields.
+message GetStatusRequest {}
 
-message GetStatusResponse{
-    LogStatus log_status = 1;
-    ProcessStatus process_status = 2;
+// GetStatusResponse contains process state and per-stream child log status.
+message GetStatusResponse {
+  // process_status is the current status of the supervised child process.
+  ProcessStatus process_status = 1;
+
+  // log_status contains retained log ranges for stdout and stderr.
+  ChildLogStatus log_status = 2;
 }
 
-message LogStatus {
-    // The current starting offset of logs that can be streamed
-    // using GetLog.
-    uint64 begin_offset = 1;
-    // The current ending offset of logs that can be streamed
-    // using GetLog.
-    uint64 end_offset = 2;
-}
-
+// ProcessStatus describes the supervised child process at one point in time.
 message ProcessStatus {
-    // Most recent time the runner launched the process it's managing.
-    uint64 start_time_ms = 1;
-    // Number of times the process launched by the runner had to be
-    // restarted since the runner started.
-    uint64 restarts = 2;
-    // The command the runner is running to launch the process.
-    repeated string cmd = 3;
+  // running is true when the child process is currently alive.
+  bool running = 1;
+
+  // current_start_time is set to the start time of the currently running child.
+  // It is unset when running is false.
+  google.protobuf.Timestamp current_start_time = 2;
+
+  // last_exit_time is set to the most recent child exit time. It is unset when
+  // no child process has exited since runner startup.
+  google.protobuf.Timestamp last_exit_time = 3;
+
+  // last_exit_code is set when the most recent child exit produced a numeric
+  // exit code. It is unset when there has been no exit or the process ended by
+  // signal without an exit code.
+  optional int32 last_exit_code = 4;
+
+  // last_exit_signal is set when the most recent child exit was caused by a
+  // signal. It is unset when there has been no exit or no signal is known.
+  optional string last_exit_signal = 5;
+
+  // restart_count is the number of child process starts after the initial
+  // launch attempt.
+  uint64 restart_count = 6;
+
+  // command is the configured child command and arguments.
+  repeated string command = 7;
 }
 
+// ChildLogStatus groups retained ranges for both child output streams.
+message ChildLogStatus {
+  // stdout is the retained range for child stdout logs.
+  LogStatus stdout = 1;
+
+  // stderr is the retained range for child stderr logs.
+  LogStatus stderr = 2;
+}
+
+// LogStatus is the retained half-open ID range for one child log stream.
+message LogStatus {
+  // begin_id is the oldest retained entry ID for this stream.
+  uint64 begin_id = 1;
+
+  // end_id is one past the newest assigned entry ID for this stream. Clients
+  // may request end_id from GetLog to wait for future entries.
+  uint64 end_id = 2;
+}
+
+// LogSource identifies a child output stream.
 enum LogSource {
-    LOG_SOURCE_UNSPECIFIED = 0;
-    LOG_SOURCE_STDOUT = 1;
-    LOG_SOURCE_STDERR = 2;
+  // LOG_SOURCE_UNSPECIFIED is invalid in GetLog requests.
+  LOG_SOURCE_UNSPECIFIED = 0;
+
+  // LOG_SOURCE_STDOUT selects child stdout.
+  LOG_SOURCE_STDOUT = 1;
+
+  // LOG_SOURCE_STDERR selects child stderr.
+  LOG_SOURCE_STDERR = 2;
 }
 
-message GetLogRequest{
-    LogSource source = 1;
-    // Stream logs from the given offset. Setting to 0 streams from whatever
-    // is the current starting offset.
-    uint64 offset = 2;
-    // Stream up to the specified number of log bytes. Setting to 0 means no
-    // limit.
-    uint64 limit = 3;
+// GetLogRequest selects one stream and the first child log entry ID to return.
+message GetLogRequest {
+  // source selects stdout or stderr. LOG_SOURCE_UNSPECIFIED is invalid.
+  LogSource source = 1;
+
+  // start_id is the first entry ID to stream. It must be within the selected
+  // stream's inclusive readable range [begin_id, end_id].
+  uint64 start_id = 2;
+
+  // max_entries limits the number of entries returned before the RPC ends. A
+  // value of zero means follow until client cancellation.
+  uint64 max_entries = 3;
 }
 
-message GetLogResponse{
-    repeated LogEntry log_entry = 1;
+// GetLogResponse contains one batch of child log entries.
+message GetLogResponse {
+  // entries are ordered by ID within the selected source stream.
+  repeated LogEntry entries = 1;
 }
 
-enum LogLevel {
-    LOG_LEVEL_UNSPECIFIED = 0;
-    LOG_LEVEL_DEBUG = 1;
-    LOG_LEVEL_INFO = 2;
-    LOG_LEVEL_WARN = 3;
-    LOG_LEVEL_ERROR = 4;
-}
-
+// LogEntry is one accepted child log entry from stdout or stderr.
 message LogEntry {
-    int64 timestamp_ms = 1;
-    LogLevel level = 2;
-    string msg = 3;
+  // timestamp is the producer timestamp for structured logs or the runner's
+  // first-byte observation time for plain-text logs.
+  google.protobuf.Timestamp timestamp = 1;
+
+  // id is the per-stream monotonically increasing log entry ID. IDs are scoped
+  // by source; stdout id 7 and stderr id 7 may refer to unrelated entries.
+  uint64 id = 2;
+
+  // source is the child output stream this entry came from.
+  LogSource source = 3;
+
+  // level is INFO or ERROR for plain text logs, or the non-empty structured log
+  // level string supplied by the child process.
+  string level = 4;
+
+  // message is the stored log message. Plain text messages include the trailing
+  // newline when one was present.
+  string message = 5;
+
+  // truncated is true when the original child log entry exceeded the configured
+  // maximum retained entry size.
+  bool truncated = 6;
+
+  // source_location is set only when structured log input supplied a usable
+  // source location.
+  SourceLocation source_location = 7;
+}
+
+// SourceLocation identifies the optional producer code location for a
+// structured child log entry.
+message SourceLocation {
+  // function is the producer function name when supplied.
+  string function = 1;
+
+  // file is the producer source file path when supplied.
+  string file = 2;
+
+  // line is the producer source line when supplied.
+  uint32 line = 3;
+}
+
+// RunnerEvent is one retained event about runner lifecycle, process, logging,
+// parsing, storage, or API behavior.
+message RunnerEvent {
+  // id is the globally monotonically increasing event ID. Event IDs are
+  // independent from stdout and stderr log entry IDs.
+  uint64 id = 1;
+
+  // timestamp is the time the runner event was recorded.
+  google.protobuf.Timestamp timestamp = 2;
+
+  // severity is the runner-defined severity string for this event.
+  string severity = 3;
+
+  // code is a stable runner-defined event code suitable for client matching.
+  string code = 4;
+
+  // message is the human-readable event description.
+  string message = 5;
+
+  // details contains optional structured event metadata. Values are strings to
+  // keep the v1 API simple and language-neutral.
+  map<string, string> details = 6;
+}
+
+// GetEventsRequest selects which retained runner events to return.
+message GetEventsRequest {
+  // request_mode selects the event window. When unset, all retained events are
+  // returned, bounded by the runner's configured event retention capacity.
+  oneof request_mode {
+    // from_id returns retained events with id >= from_id. If from_id is older
+    // than the retained ring, the response starts at the oldest retained event.
+    uint64 from_id = 1;
+
+    // last_count returns up to this many newest retained events. A value of
+    // zero returns no events.
+    uint64 last_count = 2;
+  }
+}
+
+// GetEventsResponse contains retained runner events and the next polling ID.
+message GetEventsResponse {
+  // events are ordered by ascending event ID.
+  repeated RunnerEvent events = 1;
+
+  // next_id is one past the newest event ID assigned by runner. Clients can use
+  // it as from_id on the next poll.
+  uint64 next_id = 2;
 }

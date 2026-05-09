@@ -21,14 +21,26 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	Runner_GetStatus_FullMethodName = "/homelabdepot.runner.Runner/GetStatus"
 	Runner_GetLog_FullMethodName    = "/homelabdepot.runner.Runner/GetLog"
+	Runner_GetEvents_FullMethodName = "/homelabdepot.runner.Runner/GetEvents"
 )
 
 // RunnerClient is the client API for Runner service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// Runner exposes the supervised child process status, retained child logs, and
+// retained runner lifecycle events.
 type RunnerClient interface {
+	// GetStatus returns a point-in-time snapshot of the child process and the
+	// retained ranges for stdout and stderr logs.
 	GetStatus(ctx context.Context, in *GetStatusRequest, opts ...grpc.CallOption) (*GetStatusResponse, error)
+	// GetLog streams retained and future child log entries for one selected
+	// source. The stream ends after max_entries entries when max_entries is
+	// nonzero, or follows until client cancellation when max_entries is zero.
 	GetLog(ctx context.Context, in *GetLogRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GetLogResponse], error)
+	// GetEvents returns retained runner lifecycle events using the requested
+	// event window. This RPC is not a stream; clients poll with next_id.
+	GetEvents(ctx context.Context, in *GetEventsRequest, opts ...grpc.CallOption) (*GetEventsResponse, error)
 }
 
 type runnerClient struct {
@@ -68,12 +80,33 @@ func (c *runnerClient) GetLog(ctx context.Context, in *GetLogRequest, opts ...gr
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Runner_GetLogClient = grpc.ServerStreamingClient[GetLogResponse]
 
+func (c *runnerClient) GetEvents(ctx context.Context, in *GetEventsRequest, opts ...grpc.CallOption) (*GetEventsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetEventsResponse)
+	err := c.cc.Invoke(ctx, Runner_GetEvents_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RunnerServer is the server API for Runner service.
 // All implementations must embed UnimplementedRunnerServer
 // for forward compatibility.
+//
+// Runner exposes the supervised child process status, retained child logs, and
+// retained runner lifecycle events.
 type RunnerServer interface {
+	// GetStatus returns a point-in-time snapshot of the child process and the
+	// retained ranges for stdout and stderr logs.
 	GetStatus(context.Context, *GetStatusRequest) (*GetStatusResponse, error)
+	// GetLog streams retained and future child log entries for one selected
+	// source. The stream ends after max_entries entries when max_entries is
+	// nonzero, or follows until client cancellation when max_entries is zero.
 	GetLog(*GetLogRequest, grpc.ServerStreamingServer[GetLogResponse]) error
+	// GetEvents returns retained runner lifecycle events using the requested
+	// event window. This RPC is not a stream; clients poll with next_id.
+	GetEvents(context.Context, *GetEventsRequest) (*GetEventsResponse, error)
 	mustEmbedUnimplementedRunnerServer()
 }
 
@@ -89,6 +122,9 @@ func (UnimplementedRunnerServer) GetStatus(context.Context, *GetStatusRequest) (
 }
 func (UnimplementedRunnerServer) GetLog(*GetLogRequest, grpc.ServerStreamingServer[GetLogResponse]) error {
 	return status.Errorf(codes.Unimplemented, "method GetLog not implemented")
+}
+func (UnimplementedRunnerServer) GetEvents(context.Context, *GetEventsRequest) (*GetEventsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetEvents not implemented")
 }
 func (UnimplementedRunnerServer) mustEmbedUnimplementedRunnerServer() {}
 func (UnimplementedRunnerServer) testEmbeddedByValue()                {}
@@ -140,6 +176,24 @@ func _Runner_GetLog_Handler(srv interface{}, stream grpc.ServerStream) error {
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Runner_GetLogServer = grpc.ServerStreamingServer[GetLogResponse]
 
+func _Runner_GetEvents_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetEventsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RunnerServer).GetEvents(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Runner_GetEvents_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RunnerServer).GetEvents(ctx, req.(*GetEventsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Runner_ServiceDesc is the grpc.ServiceDesc for Runner service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -150,6 +204,10 @@ var Runner_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetStatus",
 			Handler:    _Runner_GetStatus_Handler,
+		},
+		{
+			MethodName: "GetEvents",
+			Handler:    _Runner_GetEvents_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

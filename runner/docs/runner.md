@@ -136,17 +136,16 @@ Events should cover at least:
 `GetEvents` supports:
 
 - requesting the last N retained events;
-- requesting events from a supplied sequence number, inclusively, so clients can
+- requesting events from a supplied event ID, inclusively, so clients can
   de-duplicate and poll incrementally.
 
-`GetEvents` uses event-specific sequence numbers, not log ID terminology.
-Runner event sequence numbers are global to the runner event stream and are
-independent from child stdout and stderr log IDs.
+`GetEvents` uses event-specific IDs, not log ID terminology. Runner event IDs
+are global to the runner event stream and are independent from child stdout and
+stderr log IDs.
 
 `GetEvents` should use a request-mode `oneof`:
 
-- `from_sequence_number`, a `uint64`, returns retained events at or after that
-  sequence number;
+- `from_id`, a `uint64`, returns retained events at or after that event ID;
 - `last_count`, a `uint64`, returns up to that many newest retained events.
 
 If neither request mode is set, `GetEvents` returns all currently retained
@@ -155,13 +154,13 @@ provided, the request is invalid. If `last_count` is `0`, the response contains
 no events. If `last_count` is larger than the retained event capacity, runner
 returns all retained events.
 
-If `from_sequence_number` is older than the retained event ring, runner starts
+If `from_id` is older than the retained event ring, runner starts
 from the oldest retained event rather than returning an error. If it is newer
-than the next event sequence number, runner returns an empty event list.
+than the next event ID, runner returns an empty event list.
 
-Every `GetEvents` response includes `next_sequence_number`, which clients can
-use as the next `from_sequence_number` when polling. Runner does not expose the
-oldest retained event sequence number in v1.
+Every `GetEvents` response includes `next_id`, which clients can use as the next
+`from_id` when polling. Runner does not expose the oldest retained event ID in
+v1.
 
 Runner events use the same per-entry message size limit as child logs. If an
 event message or included raw line exceeds that limit, it is truncated to the
@@ -197,9 +196,9 @@ consume child log IDs. Oversized but otherwise accepted log lines consume one
 log ID and set `LogEntry.truncated = true`.
 
 `GetStatus` exposes the currently retained log ID range for every child log
-stream. `begin_log_id` is the oldest retained entry log ID. `end_log_id` is one
+stream. `begin_id` is the oldest retained entry log ID. `end_id` is one
 past the newest assigned entry log ID. Retained entries are in the half-open
-range `[begin_log_id, end_log_id)`.
+range `[begin_id, end_id)`.
 
 If no entries have ever been accepted for a stream, both log IDs are `0`.
 
@@ -224,7 +223,7 @@ stores the entry with `truncated = true`.
 
 Invalid UTF-8 lines are rejected, omitted from the child log stream, and
 represented only by a runner event containing the reason, source stream, and the
-stream's current `end_log_id` as context. The raw invalid bytes are not included
+stream's current `end_id` as context. The raw invalid bytes are not included
 in the event.
 
 Plain-text entries use fixed levels by stream: stdout entries use `INFO`, and
@@ -299,7 +298,7 @@ to parse the retained prefix. If the prefix parses as a valid structured log
 entry, the entry is accepted with `truncated = true`. If the prefix cannot be
 parsed as a valid structured log entry, runner rejects the line and emits a
 runner event that includes the retained raw prefix with `truncated = true`, the
-source stream, the rejection reason, and the stream's current `end_log_id` as
+source stream, the rejection reason, and the stream's current `end_id` as
 context.
 
 Accepted truncation does not emit a runner event. The accepted child log entry's
@@ -342,7 +341,7 @@ log line or ignored structured attributes. Each row stores enough to reconstruct
 the API `LogEntry`:
 
 - `source`, either `stdout` or `stderr`;
-- `log_id`, the per-stream monotonically increasing log ID;
+- `id`, the per-stream monotonically increasing log ID;
 - `ts`, the log timestamp;
 - `level`;
 - `message`;
@@ -350,14 +349,14 @@ the API `LogEntry`:
 - optional source location fields: file, function, and line;
 - `stored_size`, the encoded retained size used for logical budget accounting.
 
-The primary key is `(source, log_id)`. This primary key is the v1 log index and
-replaces the custom binary index. `GetLog` range reads are ordered by `log_id`
+The primary key is `(source, id)`. This primary key is the v1 log index and
+replaces the custom binary index. `GetLog` range reads are ordered by `id`
 for one selected `source`. v1 does not add a full-text index or search RPC.
 
 Runner also maintains per-stream state for stdout and stderr, including:
 
 - `source`;
-- `next_log_id`, the next log ID that will be assigned;
+- `next_id`, the next log ID that will be assigned;
 - `retained_bytes`, the sum of `stored_size` values for retained rows in that
   stream.
 
@@ -367,7 +366,7 @@ match the rows retained for each stream.
 
 When retained logs exceed a stream's budget, runner rotates out old data by
 deleting the oldest rows for that source until the sum of retained `stored_size`
-values is within the stream budget. Rotation advances `begin_log_id` for the
+values is within the stream budget. Rotation advances `begin_id` for the
 affected stream and does not affect the other stream. If a client requests a log
 ID older than the current retained range, `GetLog` returns `OutOfRange` rather
 than silently starting at the oldest retained entry.
@@ -391,22 +390,22 @@ reason.
 
 ## Log Streaming API
 
-`GetStatus` exposes `begin_log_id` and `end_log_id` for every child log stream:
+`GetStatus` exposes `begin_id` and `end_id` for every child log stream:
 stdout and stderr.
 
 `GetLog` reads one source stream at a time: stdout or stderr.
 
 `GetLog` supports both historical reads and live follow:
 
-- request `begin_log_id` to start at the oldest retained entry;
+- request `begin_id` to start at the oldest retained entry;
 - request a retained entry log ID to resume from that entry;
-- request `end_log_id` to wait for future entries;
+- request `end_id` to wait for future entries;
 - request `max_entries > 0` to stream until that many log entries have been
   delivered, then end the RPC;
 - request `max_entries = 0` to follow forever until client cancellation.
 
-Valid requested log IDs are `begin_log_id <= log_id <= end_log_id` for the
-selected stream. If `log_id < begin_log_id` or `log_id > end_log_id`, `GetLog`
+Valid requested log IDs are `begin_id <= id <= end_id` for the selected stream.
+If `id < begin_id` or `id > end_id`, `GetLog`
 returns `OutOfRange`.
 
 When `max_entries > 0`, the server streams entries already available at the
@@ -422,7 +421,7 @@ cancellation strategy. The server does not impose a v1 idle timeout on log
 streams.
 
 Responses may batch multiple log entries for efficiency. Each `LogEntry` carries
-its own log ID, so batching is a transport detail. The server should
+its own ID, so batching is a transport detail. The server should
 opportunistically batch adjacent available entries without intentional delay. If
 one read from the child process yields multiple complete accepted log entries,
 active matching `GetLog` streams may receive those entries in one response.
@@ -567,13 +566,13 @@ Likely changes:
 - include per-stream log status for stdout and stderr in `GetStatus`;
 - include `running`, current start time, last exit time, last exit code, and last
   exit signal in process status;
-- add `log_id`, `truncated`, and optional structured source location to
+- add `id`, `truncated`, and optional structured source location to
   `LogEntry`;
 - keep `GetLogResponse` as `repeated LogEntry entries` and do not require batch
-  `begin_log_id` or `end_log_id` fields;
-- use a `oneof` request mode for `GetEventsRequest` with `uint64
-  from_sequence_number` and `uint64 last_count`;
-- include `next_sequence_number` in `GetEventsResponse`;
+  `begin_id` or `end_id` fields;
+- use a `oneof` request mode for `GetEventsRequest` with `uint64 from_id` and
+  `uint64 last_count`;
+- include `next_id` in `GetEventsResponse`;
 - keep stdout and stderr as the only child log sources;
 - model runner events separately from child log entries.
 
@@ -586,4 +585,4 @@ Likely changes:
 
 `OutOfRange` errors from `GetLog`, including mid-stream rotation errors, should
 include structured range details: source stream, requested or needed log ID,
-current `begin_log_id`, and current `end_log_id`.
+current `begin_id`, and current `end_id`.

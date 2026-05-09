@@ -37,7 +37,7 @@ state that the caller cannot add.
 
 Tests must make failures self-explanatory. Use assertions such as
 `t.Errorf("Validate() error = %v, want nil for default config", err)` or
-`t.Errorf("entry.LogID = %d, want %d after rejected invalid UTF-8 line", got,
+`t.Errorf("entry.ID = %d, want %d after rejected invalid UTF-8 line", got,
 want)`. If the condition is long, put a short comment above the assertion that
 states the condition being tested.
 
@@ -77,10 +77,14 @@ server:
 - Model per-stream `LogStatus` for stdout and stderr.
 - Add process fields for `running`, `current_start_time`, `last_exit_time`,
   `last_exit_code`, `last_exit_signal`, `restart_count`, and configured command.
-- Add `LogEntry.log_id`, `LogEntry.source`, `LogEntry.level` as a string,
+- Add `LogEntry.id`, `LogEntry.source`, `LogEntry.level` as a string,
   `LogEntry.message`, `LogEntry.truncated`, and optional source location.
 - Add `RunnerEvent`, `GetEventsRequest` with a request-mode `oneof`, and
-  `GetEventsResponse.next_sequence_number`.
+  `GetEventsResponse.next_id`.
+- Use concise ID field names in API messages where the message context already
+  identifies the domain: `LogEntry.id`, `LogStatus.begin_id`,
+  `LogStatus.end_id`, `GetLogRequest.start_id`, `RunnerEvent.id`,
+  `GetEventsRequest.from_id`, and `GetEventsResponse.next_id`.
 
 Unit tests:
 
@@ -140,7 +144,7 @@ Implement `internal/events`:
   optional structured details.
 - Query modes: all retained events, last N, or from sequence number
   inclusively.
-- Always return `next_sequence_number`.
+- Always return `next_id`.
 - Truncate event messages and raw-line details to the configured entry limit.
 - Keep the package concurrency-safe because process, log parsing, storage, and
   server code may record events concurrently.
@@ -148,19 +152,19 @@ Implement `internal/events`:
 Unit tests:
 
 - Sequence numbers start at zero and increase by one.
-- Ring overflow drops oldest events and keeps `next_sequence_number`.
+- Ring overflow drops oldest events and keeps `next_id`.
 - `last_count` zero returns no events.
 - `last_count` above capacity returns all retained events.
-- `from_sequence_number` before the retained range starts at the oldest retained
+- `from_id` before the retained range starts at the oldest retained
   event.
-- `from_sequence_number` after the next sequence returns an empty list.
+- `from_id` after the next event ID returns an empty list.
 - Concurrent writers and readers pass `go test -race`.
 - Truncation preserves the configured byte limit.
 
 Integration tests:
 
 - Through the gRPC server, record events and verify `GetEvents` polling can
-  de-duplicate with `next_sequence_number`.
+  de-duplicate with `next_id`.
 
 ## Phase 5: Log Parsing
 
@@ -216,10 +220,10 @@ Implement `internal/logstore`:
 - Create one SQLite database at `logs.sqlite` for both child log streams.
 - Enable WAL journal mode and `synchronous=NORMAL` during initialization so live
   readers can query retained rows while the capture path inserts new entries.
-- Store parsed API fields only: `source`, `log_id`, timestamp, level, message,
+- Store parsed API fields only: `source`, `id`, timestamp, level, message,
   truncation flag, optional source location fields, and `stored_size`.
-- Use `(source, log_id)` as the primary key and read one selected stream ordered
-  by `log_id`.
+- Use `(source, id)` as the primary key and read one selected stream ordered by
+  `id`.
 - Maintain independent per-stream state for stdout and stderr: next log ID,
   retained bytes, logical budget, and current retained range.
 - Assign log IDs only after parsing accepts an entry. Rejected lines do not
@@ -227,7 +231,7 @@ Implement `internal/logstore`:
 - Enforce retention after each accepted row by deleting oldest rows for the
   affected source until that stream's logical `stored_size` total is within its
   budget.
-- Ensure cleanup advances only the affected stream's `begin_log_id` and leaves
+- Ensure cleanup advances only the affected stream's `begin_id` and leaves
   at least the newest row for that stream.
 - Checkpoint the WAL after retention cleanup and support an optional periodic
   checkpoint so WAL growth does not hide unbounded disk use.
@@ -235,7 +239,7 @@ Implement `internal/logstore`:
   operation, stream when relevant, database path, and reason, and fail affected
   reads with internal errors.
 - Provide blocking readers that can start at any log ID in
-  `[begin_log_id, end_log_id]`, deliver batches, and fail with out-of-range if
+  `[begin_id, end_id]`, deliver batches, and fail with out-of-range if
   retention removes needed entries.
 
 Unit tests:
@@ -245,10 +249,10 @@ Unit tests:
 - Schema creation is idempotent and configures WAL plus `synchronous=NORMAL`.
 - Inserted rows round-trip all API fields, including optional source locations
   and truncation flags.
-- Appending entries advances `end_log_id`; retention advances `begin_log_id`.
+- Appending entries advances `end_id`; retention advances `begin_id`.
 - stdout and stderr log IDs and retained byte counts are independent.
 - `stored_size` accounting drives logical retention for each stream.
-- Requests below `begin_log_id` or above `end_log_id` return out-of-range.
+- Requests below `begin_id` or above `end_id` return out-of-range.
 - Retention deletes oldest rows only for the over-budget source and leaves the
   other stream untouched.
 - Retention leaves at least the newest accepted row when a single row fits the
@@ -264,7 +268,7 @@ Integration tests:
 
 - Write enough entries to exceed a small test budget, then verify retained
   ranges, deleted rows, logical byte accounting, and historical reads.
-- Hold a blocking reader at `end_log_id`, append entries, and verify it wakes
+- Hold a blocking reader at `end_id`, append entries, and verify it wakes
   without intentional delay.
 - Hold a slow reader while retention removes its needed log ID and verify it
   fails with out-of-range.
@@ -335,7 +339,7 @@ Unit tests:
 - `GetLog` with `max_entries = 0` follows until client cancellation.
 - Batching never exceeds entry count or message-size limits.
 - Storage errors map to the documented gRPC codes.
-- `GetEvents` returns expected events and `next_sequence_number` for each mode.
+- `GetEvents` returns expected events and `next_id` for each mode.
 
 Integration tests:
 
