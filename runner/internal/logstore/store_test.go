@@ -64,6 +64,27 @@ func TestOpenCreatesSchemaAndConfiguresSQLite(t *testing.T) {
 	if err := store.initialize(); err != nil {
 		t.Errorf("initialize() second call error = %v, want nil", err)
 	}
+
+	rows, err := store.db.Query("PRAGMA table_info(logs)")
+	if err != nil {
+		t.Fatalf("PRAGMA table_info(logs) error = %v, want nil", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, pk int
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			t.Fatalf("Scan(table_info) error = %v, want nil", err)
+		}
+		if name == "stored_size" {
+			t.Fatal("logs schema has stored_size column, want size accounting kept in stream state")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("table_info rows error = %v, want nil", err)
+	}
 }
 
 func TestAppendAndReadRoundTripAllFields(t *testing.T) {
@@ -135,6 +156,35 @@ func TestAppendAdvancesEndIDAndRetentionAdvancesBeginID(t *testing.T) {
 	}
 }
 
+func TestRetentionRotatesCeilTwentyPercentBeforeInsert(t *testing.T) {
+	store := openTestStore(t, t.TempDir(), 300, 4096, nil)
+	defer closeStore(t, store)
+
+	for i := 0; i < 6; i++ {
+		appendMessage(t, store, SourceStdout, "line 00\n")
+	}
+	status := store.Status()
+	if status.Stdout.BeginID != 0 || status.Stdout.EndID != 6 {
+		t.Fatalf("stdout range before threshold append = [%d,%d), want [0,6)", status.Stdout.BeginID, status.Stdout.EndID)
+	}
+
+	inserted := appendMessage(t, store, SourceStdout, "line 00\n")
+	if inserted.ID != 6 {
+		t.Fatalf("inserted.ID = %d, want append ID 6 after pre-insert rotation", inserted.ID)
+	}
+	status = store.Status()
+	if status.Stdout.BeginID != 2 || status.Stdout.EndID != 7 {
+		t.Fatalf("stdout range after rotation = [%d,%d), want [2,7) after deleting ceil(20%% of 6)", status.Stdout.BeginID, status.Stdout.EndID)
+	}
+	rows, err := store.Read(context.Background(), SourceStdout, 2, 10)
+	if err != nil {
+		t.Fatalf("Read(retained rows) error = %v, want nil", err)
+	}
+	if len(rows) != 5 || rows[0].ID != 2 || rows[len(rows)-1].ID != 6 {
+		t.Fatalf("retained rows = %+v, want IDs 2 through 6", rows)
+	}
+}
+
 func TestStreamsRetainIndependentIDsAndBudgets(t *testing.T) {
 	store := openTestStore(t, t.TempDir(), 55, 4096, nil)
 	defer closeStore(t, store)
@@ -200,9 +250,6 @@ func TestCheckpointAndRotationEvents(t *testing.T) {
 	appendMessage(t, store, SourceStdout, "first stdout\n")
 	appendMessage(t, store, SourceStdout, "second stdout\n")
 	appendMessage(t, store, SourceStdout, "third stdout\n")
-	if err := store.Checkpoint(context.Background()); err != nil {
-		t.Fatalf("Checkpoint() error = %v, want nil", err)
-	}
 
 	snapshot, err := ring.Query(context.Background(), events.Query{Mode: events.QueryAll})
 	if err != nil {

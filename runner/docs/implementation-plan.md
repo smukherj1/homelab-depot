@@ -222,7 +222,7 @@ Implement `internal/logstore`:
 - Enable WAL journal mode and `synchronous=NORMAL` during initialization so live
   readers can query retained rows while the capture path inserts new entries.
 - Store parsed API fields only: `source`, `id`, timestamp, level, message,
-  truncation flag, optional source location fields, and `stored_size`.
+  truncation flag, and optional source location fields.
 - Use `(source, id)` as the primary key and read one selected stream ordered by
   `id`.
 - Maintain independent per-stream state for stdout and stderr: next log ID,
@@ -252,7 +252,8 @@ Unit tests:
   and truncation flags.
 - Appending entries advances `end_id`; retention advances `begin_id`.
 - stdout and stderr log IDs and retained byte counts are independent.
-- `stored_size` accounting drives logical retention for each stream.
+- Stored-size accounting is derived from persisted API fields and kept in
+  per-stream memory state rather than stored on each log row.
 - Requests below `begin_id` or above `end_id` return out-of-range.
 - Retention deletes oldest rows only for the over-budget source and leaves the
   other stream untouched.
@@ -273,6 +274,57 @@ Integration tests:
   without intentional delay.
 - Hold a slow reader while retention removes its needed log ID and verify it
   fails with out-of-range.
+
+## Phase 6.1: Pre-Insert Log Rotation Simplification
+
+Update `internal/logstore` retention so rotation is a best-effort pre-insert
+operation with simpler failure semantics:
+
+- Compute the incoming entry's logical stored size before assigning its final
+  log ID or inserting the row.
+- If `retained_bytes + incoming_size` is greater than 97% of the affected
+  stream's budget, rotate before insertion.
+- Rotate exactly one batch per append attempt: delete `ceil(20%)` of the
+  currently retained entries for that source, chosen from the oldest side.
+- Never rotate away every retained entry for a stream. If the stream has zero or
+  one retained entries, skip rotation and allow the append to proceed.
+- Select the rotation batch once, verify the IDs are contiguous from
+  `begin_id`, sum their derived stored sizes, then delete them with one ranged
+  SQL statement.
+- Commit rotation and insertion in separate transactions. If rotation fails,
+  fail the append before assigning or inserting the new entry. If rotation
+  succeeds and insertion later fails, keep the committed rotation.
+- Update in-memory stream state only after the corresponding transaction
+  commits. Rotation updates `begin_id` and `retained_bytes`; insertion updates
+  `next_id` and `retained_bytes`.
+- Keep retained byte accounting in memory only. Do not add per-row
+  `stored_size` metadata to SQLite; derive size from persisted API fields when
+  reading a row for rotation or API delivery.
+- Continue checkpointing the WAL after retention activity and recording
+  rotation/storage-failure events with stream and range details.
+
+Unit tests:
+
+- Schema inspection verifies the `logs` table has no `stored_size` column.
+- Appending an entry that projects usage over the 97% threshold rotates before
+  insertion and assigns the new entry the next uninterrupted stream ID.
+- A stream with six retained entries deletes two old entries when rotation is
+  triggered, proving `ceil(20%)` behavior.
+- Rotation leaves at least one retained entry when a stream has only one entry.
+- Rotation failure before insertion leaves `begin_id`, `end_id`, retained byte
+  counts, and rows unchanged.
+- Insert failure after successful rotation leaves the committed rotation in
+  place and does not advance `next_id`.
+- Retained byte accounting after rotation equals the previous retained bytes
+  minus the derived sizes of the deleted rows.
+- stdout rotation does not affect stderr IDs, rows, or retained byte counts.
+
+Integration tests:
+
+- Write enough stdout entries to trigger multiple pre-insert rotations and
+  verify retained ranges remain contiguous and readable.
+- Hold a live reader across a pre-insert rotation and verify it receives
+  `OutOfRange` if its needed entry was rotated before delivery.
 
 ## Phase 7: Process Supervisor
 

@@ -19,12 +19,11 @@ import (
 const (
 	databaseFileName     = "logs.sqlite"
 	maxBatchEntries      = 1024
-	maxBatchStoredBytes  = 4 * 1024 * 1024
+	rotationThresholdPct = 97
+	rotationBatchPct     = 20
 	eventStorageFailure  = "logstore.storage_failure"
 	eventLogRotation     = "logstore.rotation"
 	sqliteDriverName     = "sqlite"
-	checkpointMode       = "PASSIVE"
-	checkpointModeForced = "TRUNCATE"
 )
 
 // ErrOutOfRange reports that a requested log ID is outside the retained range
@@ -38,15 +37,14 @@ type EventRecorder interface {
 
 // Options configures SQLite-backed child log storage. Directory must be an
 // existing writable directory owned by the caller. StdoutBudget and
-// StderrBudget are logical per-stream retention budgets measured in stored_size
-// bytes. Events may be nil, in which case storage failures are returned without
-// also recording runner events.
+// StderrBudget are logical per-stream retention budgets measured in derived
+// retained bytes. Events may be nil, in which case storage failures are
+// returned without also recording runner events.
 type Options struct {
-	Directory          string
-	StdoutBudget       uint64
-	StderrBudget       uint64
-	Events             EventRecorder
-	CheckpointInterval time.Duration
+	Directory    string
+	StdoutBudget uint64
+	StderrBudget uint64
+	Events       EventRecorder
 }
 
 // Source identifies one child output stream retained by the store.
@@ -98,9 +96,6 @@ type Store struct {
 	events EventRecorder
 	states map[Source]*streamState
 	closed bool
-
-	checkpointInterval time.Duration
-	lastCheckpoint     time.Time
 }
 
 type streamState struct {
@@ -134,11 +129,10 @@ func Open(opts Options) (*Store, error) {
 		return nil, fmt.Errorf("open SQLite database %q: %w", path, err)
 	}
 	store := &Store{
-		db:                 db,
-		path:               path,
-		events:             opts.Events,
-		states:             make(map[Source]*streamState),
-		checkpointInterval: opts.CheckpointInterval,
+		db:     db,
+		path:   path,
+		events: opts.Events,
+		states: make(map[Source]*streamState),
 	}
 	store.cond = sync.NewCond(&store.mu)
 	store.states[SourceStdout] = &streamState{budget: opts.StdoutBudget}
@@ -190,9 +184,11 @@ func (s *Store) EndID(source Source) uint64 {
 	return state.nextID
 }
 
-// Append stores one accepted parsed log entry, assigns the stream-scoped ID,
-// enforces retention for that entry's source, checkpoints the WAL after
-// retention, wakes blocked readers, and returns the stored entry snapshot.
+// Append stores one accepted parsed log entry, assigning the stream-scoped ID.
+// If the projected stream usage crosses the retention threshold, Append first
+// rotates a batch of old rows in a separate committed transaction. After the
+// entry is committed, Append checkpoints the WAL, wakes blocked readers, and
+// returns the stored entry snapshot.
 func (s *Store) Append(ctx context.Context, parsed logparse.Entry) (Entry, error) {
 	if err := validateSource(parsed.Source); err != nil {
 		return Entry{}, err
@@ -209,7 +205,6 @@ func (s *Store) Append(ctx context.Context, parsed logparse.Entry) (Entry, error
 
 	state := s.states[parsed.Source]
 	entry := Entry{
-		ID:             state.nextID,
 		Timestamp:      parsed.Timestamp,
 		Source:         parsed.Source,
 		Level:          parsed.Level,
@@ -219,6 +214,16 @@ func (s *Store) Append(ctx context.Context, parsed logparse.Entry) (Entry, error
 	}
 	entry.StoredSize = storedSize(entry)
 
+	rotated, err := s.rotateBeforeAppend(ctx, parsed.Source, state, entry.StoredSize)
+	if err != nil {
+		s.recordStorageFailure("rotate before append", parsed.Source, err)
+		return Entry{}, fmt.Errorf("rotate before append: %w", err)
+	}
+	if rotated {
+		s.recordRotation(parsed.Source, state)
+	}
+
+	entry.ID = state.nextID
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		s.recordStorageFailure("begin append transaction", parsed.Source, err)
@@ -229,26 +234,12 @@ func (s *Store) Append(ctx context.Context, parsed logparse.Entry) (Entry, error
 		s.recordStorageFailure("insert log entry", parsed.Source, err)
 		return Entry{}, fmt.Errorf("insert log entry: %w", err)
 	}
-	state.nextID++
-	state.retainedBytes += entry.StoredSize
-	rotated, err := s.enforceRetention(ctx, tx, parsed.Source, state)
-	if err != nil {
-		_ = tx.Rollback()
-		s.recordStorageFailure("enforce retention", parsed.Source, err)
-		return Entry{}, fmt.Errorf("enforce retention: %w", err)
-	}
 	if err := tx.Commit(); err != nil {
 		s.recordStorageFailure("commit append transaction", parsed.Source, err)
 		return Entry{}, fmt.Errorf("commit append transaction: %w", err)
 	}
-	if rotated {
-		s.recordRotation(parsed.Source, state)
-	}
-	if err := s.checkpoint(ctx, checkpointMode); err != nil {
-		s.recordStorageFailure("checkpoint WAL", parsed.Source, err)
-		return Entry{}, fmt.Errorf("checkpoint WAL: %w", err)
-	}
-	s.lastCheckpoint = time.Now()
+	state.nextID++
+	state.retainedBytes += entry.StoredSize
 	s.cond.Broadcast()
 	return cloneEntry(entry), nil
 }
@@ -346,19 +337,6 @@ func (s *Store) Stream(ctx context.Context, source Source, startID uint64, maxEn
 	}
 }
 
-// Checkpoint forces a truncating WAL checkpoint. It is exposed primarily for
-// lifecycle hooks and tests that need an observable checkpoint operation.
-func (s *Store) Checkpoint(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.checkpoint(ctx, checkpointModeForced); err != nil {
-		s.recordStorageFailure("checkpoint WAL", "", err)
-		return fmt.Errorf("checkpoint WAL: %w", err)
-	}
-	s.lastCheckpoint = time.Now()
-	return nil
-}
-
 func cleanupRunnerSQLiteFiles(directory string) error {
 	for _, name := range []string{databaseFileName, databaseFileName + "-wal", databaseFileName + "-shm"} {
 		path := filepath.Join(directory, name)
@@ -376,18 +354,20 @@ func (s *Store) initialize() error {
 	if _, err := s.db.Exec("PRAGMA synchronous=NORMAL"); err != nil {
 		return fmt.Errorf("set synchronous=NORMAL for %q: %w", s.path, err)
 	}
-	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS logs (
-		source TEXT NOT NULL,
-		id INTEGER NOT NULL,
-		timestamp TEXT NOT NULL,
-		level TEXT NOT NULL,
-		message TEXT NOT NULL,
-		truncated INTEGER NOT NULL,
-		source_function TEXT,
-		source_file TEXT,
-		source_line INTEGER,
-		PRIMARY KEY (source, id)
-	) WITHOUT ROWID`); err != nil {
+	if _, err := s.db.Exec(`
+CREATE TABLE IF NOT EXISTS logs (
+	source TEXT NOT NULL,
+	id INTEGER NOT NULL,
+	timestamp TEXT NOT NULL,
+	level TEXT NOT NULL,
+	message TEXT NOT NULL,
+	truncated INTEGER NOT NULL,
+	source_function TEXT,
+	source_file TEXT,
+	source_line INTEGER,
+	PRIMARY KEY (source, id)
+) WITHOUT ROWID
+`); err != nil {
 		return fmt.Errorf("create log schema for %q: %w", s.path, err)
 	}
 	return nil
@@ -423,28 +403,61 @@ func insertEntry(ctx context.Context, tx *sql.Tx, entry Entry) error {
 	return err
 }
 
-func (s *Store) enforceRetention(ctx context.Context, tx *sql.Tx, source Source, state *streamState) (bool, error) {
-	rotated := false
-	for state.retainedBytes > state.budget && state.beginID+1 < state.nextID {
-		var id uint64
-		var size uint64
-		err := tx.QueryRowContext(ctx, `SELECT id, stored_size FROM logs
-			WHERE source = ? ORDER BY id ASC LIMIT 1`, string(source)).Scan(&id, &size)
-		if err != nil {
-			return rotated, err
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM logs WHERE source = ? AND id = ?`, string(source), id); err != nil {
-			return rotated, err
-		}
-		if size > state.retainedBytes {
-			state.retainedBytes = 0
-		} else {
-			state.retainedBytes -= size
-		}
-		state.beginID = id + 1
-		rotated = true
+func (s *Store) rotateBeforeAppend(ctx context.Context, source Source, state *streamState, incomingSize uint64) (bool, error) {
+	if !projectedUsageExceedsThreshold(state.retainedBytes, incomingSize, state.budget) {
+		return false, nil
 	}
-	return rotated, nil
+	retainedCount := state.nextID - state.beginID
+	if retainedCount <= 1 {
+		return false, nil
+	}
+	deleteCount := ceilPercent(retainedCount, rotationBatchPct)
+	if deleteCount >= retainedCount {
+		deleteCount = retainedCount - 1
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin rotation transaction: %w", err)
+	}
+	expiredEntries, err := s.readTxBatchLocked(ctx, tx, source, state.beginID, deleteCount)
+	if err != nil {
+		_ = tx.Rollback()
+		return false, fmt.Errorf("read rotation batch: %w", err)
+	}
+	if len(expiredEntries) != int(deleteCount) {
+		_ = tx.Rollback()
+		return false, fmt.Errorf("inconsistent internal state for source %v: expected %v retained entries starting from id %v but storage returned %v",
+			source, deleteCount, state.beginID, len(expiredEntries))
+	}
+	var expiredBytes uint64
+	for i, entry := range expiredEntries {
+		wantID := state.beginID + uint64(i)
+		if entry.ID != wantID {
+			_ = tx.Rollback()
+			return false, fmt.Errorf("inconsistent internal state for source %v: got ID %v but wanted %v at rotation position %v",
+				source, entry.ID, wantID, i)
+		}
+		expiredBytes += entry.StoredSize
+	}
+	lastExpiredID := expiredEntries[len(expiredEntries)-1].ID
+	if _, err := tx.ExecContext(ctx, `DELETE FROM logs WHERE source = ? AND id >= ? AND id <= ?`, string(source), state.beginID, lastExpiredID); err != nil {
+		_ = tx.Rollback()
+		return false, fmt.Errorf("delete rotation batch: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit rotation transaction: %w", err)
+	}
+	state.beginID = lastExpiredID + 1
+	if expiredBytes > state.retainedBytes {
+		state.retainedBytes = 0
+	} else {
+		state.retainedBytes -= expiredBytes
+	}
+	if err := s.checkpoint(ctx); err != nil {
+		s.recordStorageFailure("checkpoint WAL", source, err)
+	}
+	return true, nil
 }
 
 func (s *Store) validateReadableLocked(source Source, startID uint64) error {
@@ -458,9 +471,21 @@ func (s *Store) validateReadableLocked(source Source, startID uint64) error {
 	return nil
 }
 
+func (s *Store) readTxBatchLocked(ctx context.Context, tx *sql.Tx, source Source, startID, limit uint64) ([]Entry, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id, timestamp, level, message, truncated,
+		source_function, source_file, source_line
+		FROM logs WHERE source = ? AND id >= ? ORDER BY id ASC LIMIT ?`,
+		string(source), startID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return s.scanEntries(rows, source)
+}
+
 func (s *Store) readBatchLocked(ctx context.Context, source Source, startID uint64, limit uint64) ([]Entry, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, timestamp, level, message, truncated,
-		source_function, source_file, source_line, stored_size
+		source_function, source_file, source_line
 		FROM logs WHERE source = ? AND id >= ? ORDER BY id ASC LIMIT ?`,
 		string(source), startID, limit)
 	if err != nil {
@@ -468,15 +493,16 @@ func (s *Store) readBatchLocked(ctx context.Context, source Source, startID uint
 	}
 	defer rows.Close()
 
+	return s.scanEntries(rows, source)
+}
+
+func (s *Store) scanEntries(rows *sql.Rows, source Source) ([]Entry, error) {
 	var entries []Entry
 	var plannedBytes uint64
 	for rows.Next() {
 		entry, err := scanEntry(rows, source)
 		if err != nil {
 			return nil, err
-		}
-		if len(entries) > 0 && plannedBytes+entry.StoredSize > maxBatchStoredBytes {
-			break
 		}
 		entries = append(entries, entry)
 		plannedBytes += entry.StoredSize
@@ -519,11 +545,8 @@ func scanEntry(rows *sql.Rows, source Source) (Entry, error) {
 	return entry, nil
 }
 
-func (s *Store) checkpoint(ctx context.Context, mode string) error {
-	if s.checkpointInterval > 0 && !s.lastCheckpoint.IsZero() && mode == checkpointMode && time.Since(s.lastCheckpoint) < s.checkpointInterval {
-		return nil
-	}
-	_, err := s.db.ExecContext(ctx, "PRAGMA wal_checkpoint("+mode+")")
+func (s *Store) checkpoint(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
 	return err
 }
 
@@ -562,11 +585,37 @@ func validateSource(source Source) error {
 
 func storedSize(entry Entry) uint64 {
 	size := uint64(len(entry.Level) + len(entry.Message) + len(entry.Source))
-	size += 8 + 8 + 1
+	// ID, Timestamp, Truncated
+	size += 8 + 8 + 8
 	if entry.SourceLocation != nil {
-		size += uint64(len(entry.SourceLocation.Function) + len(entry.SourceLocation.File) + 4)
+		size += uint64(len(entry.SourceLocation.Function) + len(entry.SourceLocation.File))
+		// SourceLocation.Line
+		size += uint64(8)
 	}
 	return size
+}
+
+func rotationThreshold(budget uint64) uint64 {
+	return percentFloor(budget, rotationThresholdPct)
+}
+
+func ceilPercent(value uint64, percent uint64) uint64 {
+	if value == 0 || percent == 0 {
+		return 0
+	}
+	return value/100*percent + ((value%100)*percent+99)/100
+}
+
+func projectedUsageExceedsThreshold(retainedBytes uint64, incomingSize uint64, budget uint64) bool {
+	threshold := rotationThreshold(budget)
+	if retainedBytes > threshold {
+		return true
+	}
+	return incomingSize > threshold-retainedBytes
+}
+
+func percentFloor(value uint64, percent uint64) uint64 {
+	return value/100*percent + (value%100)*percent/100
 }
 
 func streamStatus(state *streamState) StreamStatus {

@@ -344,8 +344,7 @@ the API `LogEntry`:
 - `level`;
 - `message`;
 - `truncated`;
-- optional source location fields: file, function, and line;
-- `stored_size`, the encoded retained size used for logical budget accounting.
+- optional source location fields: file, function, and line.
 
 The primary key is `(source, id)`. This primary key is the v1 log index and
 replaces the custom binary index. `GetLog` range reads are ordered by `id`
@@ -355,23 +354,38 @@ Runner also maintains per-stream state for stdout and stderr, including:
 
 - `source`;
 - `next_id`, the next log ID that will be assigned;
-- `retained_bytes`, the sum of `stored_size` values for retained rows in that
-  stream.
+- `retained_bytes`, the encoded retained size for rows in that stream.
 
-This state may be kept in SQLite or in memory. It is an implementation detail
-for assigning log IDs and enforcing budgets; the observable retained range must
-match the rows retained for each stream.
+This state is kept in memory during the runner lifetime. Logs are deleted on
+startup, so persisting stream state provides no recovery value in v1. The
+observable retained range must match the rows retained for each stream.
 
-When retained logs exceed a stream's budget, runner rotates out old data by
-deleting the oldest rows for that source until the sum of retained `stored_size`
-values is within the stream budget. Rotation advances `begin_id` for the
-affected stream and does not affect the other stream. If a client requests a log
-ID older than the current retained range, `GetLog` returns `OutOfRange` rather
-than silently starting at the oldest retained entry.
+Before inserting an accepted log entry, runner computes the entry's logical
+stored size from the persisted API fields and checks projected stream usage:
+`retained_bytes + new_entry_size`. If projected usage is greater than 97% of
+the stream budget, runner rotates old data before the insert. Rotation deletes a
+single batch of `ceil(20%)` of the currently retained entries for that source,
+chosen from the oldest side of the stream. Rotation never deletes every retained
+entry for a stream; if there is only one retained entry, runner leaves it in
+place and allows the next insert to proceed.
 
-Retention cleanup runs after accepting a new row for the affected stream. Since
-v1 requires each stream budget to be larger than the maximum accepted log entry
-size, cleanup should always leave at least the newest row for that stream.
+Rotation advances `begin_id` for the affected stream and does not affect the
+other stream. If a client requests a log ID older than the current retained
+range, `GetLog` returns `OutOfRange` rather than silently starting at the oldest
+retained entry.
+
+Rotation and insertion are separate committed operations. If pre-insert rotation
+fails, the append fails before assigning or inserting a new log ID. If rotation
+succeeds but the later insert fails, the rotation remains committed; this is
+acceptable because retention is best effort and logs are not a durable audit
+record in v1. Stream state is updated only after the corresponding SQLite
+transaction commits.
+
+Since v1 requires each stream budget to be larger than the maximum accepted log
+entry size, logical usage can overshoot the threshold by at most a bounded
+amount per accepted entry. The budget is best-effort retention pressure, not an
+exact promise that every insert ends below the threshold or below the configured
+budget.
 
 The disk budget is a logical per-stream budget over retained encoded log entry
 bytes, not an exact cap on physical SQLite file size. The physical
