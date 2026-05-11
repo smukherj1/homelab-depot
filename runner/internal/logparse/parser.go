@@ -88,12 +88,17 @@ type StreamParser struct {
 	events        EventRecorder
 	currentEndID  func(Source) uint64
 
-	buf           []byte
-	lineStarted   bool
+	// Parser state.
+	// The partially accepted bytes in a line.
+	buf []byte
+	// True when we've begun accepting bytes for a line.
+	lineStarted bool
+	// Time when we began accepting bytes for the line.
 	lineTimestamp time.Time
-	truncated     bool
-	discarding    bool
-	closed        bool
+	// Whether the line exceeded max bytes and is being truncated.
+	truncated bool
+	// Whether the parser was closed and should not accept new bytes.
+	closed bool
 }
 
 // NewStreamParser constructs a parser for one child output stream. The parser
@@ -135,12 +140,11 @@ func (p *StreamParser) Write(chunk []byte) ([]Entry, error) {
 		if !p.lineStarted {
 			p.startLine()
 		}
-		if !p.discarding {
+		if !p.truncated {
 			if uint64(len(p.buf)) < p.maxEntryBytes {
 				p.buf = append(p.buf, b)
 			} else {
 				p.truncated = true
-				p.discarding = true
 			}
 		}
 		if b == '\n' {
@@ -173,7 +177,6 @@ func (p *StreamParser) startLine() {
 	p.lineStarted = true
 	p.lineTimestamp = p.clock()
 	p.truncated = false
-	p.discarding = false
 	p.buf = p.buf[:0]
 }
 
@@ -197,7 +200,6 @@ func (p *StreamParser) resetLine() {
 	p.lineStarted = false
 	p.lineTimestamp = time.Time{}
 	p.truncated = false
-	p.discarding = false
 	p.buf = p.buf[:0]
 }
 
