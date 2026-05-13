@@ -164,12 +164,10 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		return errors.New("process supervisor already started")
 	}
 	s.started = true
-	s.mu.Unlock()
-
-	s.record(events.SeverityInfo, eventRunnerStartup, "runner process supervisor started", nil)
-
 	loopCtx, loopCancel := context.WithCancel(ctx)
 	s.loopCancel = loopCancel
+	s.mu.Unlock()
+
 	go s.loop(loopCtx)
 	return nil
 }
@@ -246,7 +244,7 @@ func (s *Supervisor) forceKillIfStillRunning() {
 
 func (s *Supervisor) loop(ctx context.Context) {
 	defer close(s.loopDone)
-
+	s.record(events.SeverityInfo, eventRunnerStartup, "runner process supervisor started", nil)
 	for ; !s.isStopping(); s.waitBeforeNextStart(ctx) {
 		childDone, err := s.startChild(ctx)
 		if err != nil {
