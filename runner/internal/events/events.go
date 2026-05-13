@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -101,6 +103,14 @@ func NewRing(capacity uint64, maxEntryBytes uint64, clock Clock) (*Ring, error) 
 	}, nil
 }
 
+func serializeMap(m map[string]string) string {
+	vals := make([]string, len(m))
+	for k, v := range m {
+		vals = append(vals, fmt.Sprintf("%v=%v", k, v))
+	}
+	return strings.Join(vals, ", ")
+}
+
 // Record appends one runner event, assigning its ID and timestamp. Message and
 // detail values are truncated to the ring's configured byte limit before
 // retention. The returned Event is a snapshot copy and can be mutated by the
@@ -117,6 +127,8 @@ func (r *Ring) Record(severity Severity, code string, message string, details ma
 		Message:   truncateUTF8(message, r.maxEntryBytes),
 		Details:   truncateDetails(details, r.maxEntryBytes),
 	}
+	log.Printf("ID=%v (%v) %v %v %v %v",
+		event.ID, event.Timestamp, event.Severity, event.Code, event.Message, serializeMap(event.Details))
 	r.nextID++
 	if uint64(len(r.events)) == r.capacity {
 		copy(r.events, r.events[1:])

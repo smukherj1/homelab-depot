@@ -83,23 +83,34 @@ type Supervisor struct {
 	clock   Clock
 	factory CommandFactory
 
-	// Supervisor state.
-	// Protects all state variables below.
-	mu     sync.Mutex
+	// mu protects all the fields below.
+	mu sync.Mutex
+
+	// status is the snapshot served to GetStatus callers. It is updated only
+	// when a child starts or exits; while waiting for a restart delay Running is
+	// false and CurrentStartTime is nil.
 	status Status
-	// The currently running command. Nil when
-	// the Supervisor hasn't yet started the command or
-	// is waiting to restart the command.
+
+	// cmd is the currently running child. Nil means the supervisor has not
+	// started a child yet, is between restarts, or shutdown has already observed
+	// the child exit.
 	cmd *exec.Cmd
-	// Whether the supervisor was asked to shutdown.
+
+	// stopping is set by Shutdown or by an unrecoverable first-start failure. The
+	// loop checks it before scheduling any new child start.
 	stopping bool
-	// Whether the super has started running the command.
+
+	// started records that Start has been called. The supervisor is single-use:
+	// after the loop exits, callers may inspect status but cannot Start again.
 	started bool
 
-	// State of the supervisor loop that keeps restarting the managed process.
-	loopCtx    context.Context
-	cancelLoop context.CancelFunc
-	done       chan struct{}
+	// Cancel function for the context passer to the command runner loop. The loop's
+	// context is a child for the context passed to Start so cancelling that context
+	// cancels the loop as well.
+	loopCancel context.CancelFunc
+	// Channel used by the process runner loop to signal completion (by closing the
+	// channel) and returning an error (if any).
+	loopDone chan error
 }
 
 // New constructs a supervisor without launching the child process. The caller
@@ -133,17 +144,16 @@ func New(opts Options) (*Supervisor, error) {
 	}
 	status := Status{Command: append([]string(nil), opts.Command...)}
 	return &Supervisor{
-		opts:    cloneOptions(opts),
-		clock:   clock,
-		factory: factory,
-		status:  status,
-		done:    make(chan struct{}),
+		opts:     cloneOptions(opts),
+		clock:    clock,
+		factory:  factory,
+		status:   status,
+		loopDone: make(chan error, 1),
 	}, nil
 }
 
-// Start launches the configured child and starts the supervision loop. The
-// first child start happens synchronously so startup errors are returned to the
-// caller with command context and are also recorded as runner events.
+// Start launches the supervised process in a parallel Go routine and
+// returns.
 func (s *Supervisor) Start(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -154,83 +164,23 @@ func (s *Supervisor) Start(ctx context.Context) error {
 		return errors.New("process supervisor already started")
 	}
 	s.started = true
-	s.loopCtx, s.cancelLoop = context.WithCancel(context.Background())
 	s.mu.Unlock()
 
 	s.record(events.SeverityInfo, eventRunnerStartup, "runner process supervisor started", nil)
-	run, err := s.startChild(ctx)
-	if err != nil {
-		s.recordStartFailed(err)
-		s.mu.Lock()
-		s.stopping = true
-		if s.cancelLoop != nil {
-			s.cancelLoop()
-		}
-		close(s.done)
-		s.mu.Unlock()
-		return err
-	}
-	go s.loop(run)
+
+	loopCtx, loopCancel := context.WithCancel(ctx)
+	s.loopCancel = loopCancel
+	go s.loop(loopCtx)
 	return nil
 }
 
 // Shutdown intentionally stops the supervised child, records shutdown events,
 // waits for the supervision loop to finish, and prevents further restarts.
 func (s *Supervisor) Shutdown(ctx context.Context) error {
-	s.mu.Lock()
-	if !s.started {
-		s.mu.Unlock()
-		return nil
-	}
-	if !s.stopping {
-		// Signal the process to shutdown by cancelling its context and sending a
-		// termination signal to the process itself.
-		s.stopping = true
-		if s.cancelLoop != nil {
-			s.cancelLoop()
-		}
-		if s.cmd != nil && s.cmd.Process != nil {
-			s.recordLocked(events.SeverityInfo, eventGracefulTermination, "terminating child process during runner shutdown", map[string]string{
-				"pid": strconv.Itoa(s.cmd.Process.Pid),
-			})
-			_ = s.cmd.Process.Signal(syscall.SIGTERM)
-		}
-	}
-	done := s.done
-	timeout := s.opts.GracefulShutdownTimeout
-	cmd := s.cmd
-	s.mu.Unlock()
+	s.beginShutdown()
 
-	if cmd != nil && cmd.Process != nil {
-		// A process was currently running. We're waiting for the cancellation triggered above to
-		// take effect.
-		select {
-		case <-done:
-		case <-time.After(timeout):
-			s.mu.Lock()
-			if s.cmd == cmd && s.status.Running {
-				s.recordLocked(events.SeverityWarn, eventForceKill, "force-killing child process after shutdown timeout", map[string]string{
-					"pid": strconv.Itoa(cmd.Process.Pid),
-				})
-				_ = cmd.Process.Kill()
-			}
-			s.mu.Unlock()
-			select {
-			case <-done:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	} else {
-		// A process is not currently running and we're waiting for
-		// the loop to shut down.
-		select {
-		case <-done:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+	if err := s.waitForShutdown(); err != nil {
+		return err
 	}
 	s.record(events.SeverityInfo, eventRunnerShutdown, "runner process supervisor stopped", nil)
 	return nil
@@ -244,43 +194,88 @@ func (s *Supervisor) Status() Status {
 	return cloneStatus(s.status)
 }
 
-func (s *Supervisor) loop(run childRun) {
-	defer close(s.done)
-	for {
-		result := s.waitChild(run)
-		s.updateExit(result)
+func (s *Supervisor) beginShutdown() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.started {
+		return
+	}
 
-		s.mu.Lock()
-		stopping := s.stopping
-		s.mu.Unlock()
-		if stopping {
-			return
-		}
+	s.stopping = true
+	s.loopCancel()
 
-		s.mu.Lock()
-		s.status.RestartCount++
-		s.mu.Unlock()
-		s.record(events.SeverityInfo, eventRestartScheduled, "child process restart scheduled", map[string]string{
-			"delay": s.opts.RestartDelay.String(),
+	if s.cmd != nil && s.cmd.Process != nil {
+		s.record(events.SeverityInfo, eventGracefulTermination, "terminating child process during runner shutdown", map[string]string{
+			"pid": strconv.Itoa(s.cmd.Process.Pid),
 		})
-		select {
-		case <-time.After(s.opts.RestartDelay):
-		case <-s.loopCtx.Done():
-			return
-		}
+		_ = s.cmd.Process.Signal(syscall.SIGTERM)
+	}
+}
 
-		next, err := s.startChild(s.loopCtx)
+func (s *Supervisor) waitForShutdown() error {
+	// Wait until either the run loop exits or until the graceful shutdown
+	// timeout. Send SIGKILL if the loop is still running after the graceful
+	// shutdown timeout.
+	select {
+	case err := <-s.loopDone:
+		return err
+	case <-time.After(s.opts.GracefulShutdownTimeout):
+		s.forceKillIfStillRunning()
+	}
+	// Wait until either the run loop exists or another graceful shutdown timeout
+	// passes. If so, we just give up, record a failure to kill the process and return.
+	select {
+	case err := <-s.loopDone:
+		return err
+	case <-time.After(s.opts.GracefulShutdownTimeout):
+		return fmt.Errorf("loop did not exit after force killing child process")
+	}
+}
+
+func (s *Supervisor) forceKillIfStillRunning() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cmd == nil || s.cmd.Process == nil {
+		return
+	}
+	s.recordLocked(events.SeverityWarn, eventForceKill, "force-killing child process after shutdown timeout", map[string]string{
+		"pid": strconv.Itoa(s.cmd.Process.Pid),
+	})
+	_ = s.cmd.Process.Kill()
+}
+
+func (s *Supervisor) loop(ctx context.Context) {
+	defer close(s.loopDone)
+
+	for ; !s.isStopping(); s.waitBeforeNextStart(ctx) {
+		childDone, err := s.startChild(ctx)
 		if err != nil {
 			s.recordStartFailed(err)
 			continue
 		}
-		run = next
+		s.waitChild(childDone)
 	}
 }
 
-type childRun struct {
-	cmd  *exec.Cmd
-	done chan captureResult
+func (s *Supervisor) waitBeforeNextStart(ctx context.Context) bool {
+	s.mu.Lock()
+	s.status.RestartCount++
+	s.mu.Unlock()
+	s.record(events.SeverityInfo, eventRestartScheduled, "child process restart scheduled", map[string]string{
+		"delay": s.opts.RestartDelay.String(),
+	})
+	select {
+	case <-time.After(s.opts.RestartDelay):
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (s *Supervisor) isStopping() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stopping
 }
 
 type captureResult struct {
@@ -290,23 +285,23 @@ type captureResult struct {
 	logErrs []error
 }
 
-func (s *Supervisor) startChild(ctx context.Context) (childRun, error) {
-	cmd := s.factory(context.Background(), s.opts.Command[0], s.opts.Command[1:]...)
+func (s *Supervisor) startChild(ctx context.Context) (<-chan captureResult, error) {
+	cmd := s.factory(ctx, s.opts.Command[0], s.opts.Command[1:]...)
 	cmd.Dir = s.opts.WorkingDirectory
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return childRun{}, fmt.Errorf("prepare stdout for command %q: %w", s.opts.Command[0], err)
+		return nil, fmt.Errorf("prepare stdout for command %q: %w", s.opts.Command[0], err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return childRun{}, fmt.Errorf("prepare stderr for command %q: %w", s.opts.Command[0], err)
+		return nil, fmt.Errorf("prepare stderr for command %q: %w", s.opts.Command[0], err)
 	}
 	if err := ctx.Err(); err != nil {
-		return childRun{}, err
+		return nil, err
 	}
 	if err := cmd.Start(); err != nil {
-		return childRun{}, fmt.Errorf("start command %q with args %v: %w", s.opts.Command[0], s.opts.Command[1:], err)
+		return nil, fmt.Errorf("start command %q with args %v: %w", s.opts.Command[0], s.opts.Command[1:], err)
 	}
 
 	startTime := s.clock()
@@ -324,11 +319,12 @@ func (s *Supervisor) startChild(ctx context.Context) (childRun, error) {
 
 	done := make(chan captureResult, 1)
 	go s.captureAndWait(cmd, stdout, stderr, done)
-	return childRun{cmd: cmd, done: done}, nil
+	return done, nil
 }
 
-// launches Go routines to capture stdout and stderr respectively and returns their results (containing any errors)
-// in the given done channel.
+// captureAndWait drains stdout and stderr while cmd.Wait observes process exit.
+// The wait result and any log capture failures are returned together so the
+// supervisor records one child-exit status after log capture has finished.
 func (s *Supervisor) captureAndWait(cmd *exec.Cmd, stdout io.Reader, stderr io.Reader, done chan<- captureResult) {
 	var wg sync.WaitGroup
 	errCh := make(chan error, 2)
@@ -370,10 +366,8 @@ func (s *Supervisor) captureStream(reader io.Reader, source logparse.Source) err
 		return err
 	}
 
-	// Background context is ok instead of the context passed in to the supervisor because the
-	// command was launched with the supervisor context. Cancellation of the context will cancel
-	// the running command and close its stdout/stderr streams that cause this stream capture to
-	// end as well.
+	// Log writes are tied to pipe lifetime rather than caller cancellation. On
+	// shutdown the child is signaled or killed, the pipes close, and capture ends.
 	ctx := context.Background()
 	buf := make([]byte, 32*1024)
 	for {
@@ -389,7 +383,8 @@ func (s *Supervisor) captureStream(reader io.Reader, source logparse.Source) err
 		if !errors.Is(readErr, io.EOF) {
 			return fmt.Errorf("read %s: %w", source, readErr)
 		}
-		// On EOF error, we close the parser and parse any remaining lines.
+		// EOF means the stream is closed; flush the parser so a final line
+		// without a trailing newline is not lost.
 		entries, err := parser.Close()
 		if err != nil {
 			return err
@@ -416,24 +411,19 @@ func (s *Supervisor) appendParsed(ctx context.Context, parser *logparse.StreamPa
 	return nil
 }
 
-func (s *Supervisor) waitChild(run childRun) captureResult {
-	return <-run.done
-}
-
-func (s *Supervisor) updateExit(result captureResult) {
+func (s *Supervisor) waitChild(childDone <-chan captureResult) {
+	result := <-childDone
 	exitTime := s.clock()
 	code, signal := exitDetails(result.cmdErr)
 
 	s.mu.Lock()
-	if s.cmd != nil {
-		s.cmd = nil
-	}
+	defer s.mu.Unlock()
+	s.cmd = nil
 	s.status.Running = false
 	s.status.CurrentStartTime = nil
 	s.status.LastExitTime = &exitTime
 	s.status.LastExitCode = code
 	s.status.LastExitSignal = signal
-	s.mu.Unlock()
 
 	details := map[string]string{}
 	if code != nil {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -134,6 +135,35 @@ func TestNonZeroExitPopulatesStatus(t *testing.T) {
 	if status.LastExitSignal != nil {
 		t.Errorf("LastExitSignal = %q, want nil for ordinary exit", *status.LastExitSignal)
 	}
+}
+
+func TestRestartStartFailureKeepsSupervisorResponsive(t *testing.T) {
+	store := newFakeStore()
+	ring := newTestRing(t)
+	sup := newTestSupervisor(t, store, ring, "exit", "0")
+	sup.opts.RestartDelay = 10 * time.Millisecond
+
+	var mu sync.Mutex
+	starts := 0
+	sup.factory = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		mu.Lock()
+		starts++
+		start := starts
+		mu.Unlock()
+		if start == 1 {
+			return exec.CommandContext(ctx, name, args...)
+		}
+		return exec.CommandContext(ctx, "/path/that/does/not/exist")
+	}
+
+	if err := sup.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v, want nil", err)
+	}
+	defer shutdownSupervisor(t, sup)
+
+	waitFor(t, 5*time.Second, func() bool {
+		return hasEvent(t, ring, eventStartFailed)
+	})
 }
 
 func TestSignalTerminationPopulatesStatus(t *testing.T) {
